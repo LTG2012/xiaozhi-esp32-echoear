@@ -232,30 +232,75 @@ public:
     {
         delete[] read_buffer_;
     }
-    void Printcharge()
+
+    // 读取电池数据：电压、电流、电量
+    void ReadBatteryData()
     {
+        // 读取电压 (0x08-0x09)
         ReadRegs(0x08, read_buffer_, 2);
-        ReadRegs(0x0c, read_buffer_ + 2, 2);
+        voltage_ = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
+
+        // 读取电流 (0x0C-0x0D)
+        ReadRegs(0x0C, read_buffer_, 2);
+        current_ = static_cast<int16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
+
+        // 读取电量百分比 SOC (0x2C-0x2D)
+        ReadRegs(0x2C, read_buffer_, 2);
+        battery_level_ = read_buffer_[0];  // SOC 低字节就是百分比
+        if (battery_level_ > 100) {
+            battery_level_ = 100;
+        }
+
+        // 读取温度
         ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
 
-        int16_t voltage = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
-        int16_t current = static_cast<int16_t>(read_buffer_[3] << 8 | read_buffer_[2]);
-        
-        // Use the variables to avoid warnings (can be removed if actual implementation uses them)
-        (void)voltage;
-        (void)current;
+        ESP_LOGD(TAG, "Battery: voltage=%dmV, current=%dmA, SOC=%d%%", voltage_, current_, battery_level_);
     }
+
+    // 获取电量百分比 (0-100)
+    uint8_t GetBatteryLevel()
+    {
+        return battery_level_;
+    }
+
+    // 判断是否在充电 (电流 > 0 表示充电)
+    bool IsCharging()
+    {
+        return current_ > 0;
+    }
+
+    // 判断是否在放电 (电流 < 0 表示放电)
+    bool IsDischarging()
+    {
+        return current_ < 0;
+    }
+
+    // 获取电压 (mV)
+    uint16_t GetVoltage()
+    {
+        return voltage_;
+    }
+
+    // 获取电流 (mA，正值表示充电，负值表示放电)
+    int16_t GetCurrent()
+    {
+        return current_;
+    }
+
     static void TaskFunction(void *pvParameters)
     {
         Charge* charge = static_cast<Charge*>(pvParameters);
         while (true) {
-            charge->Printcharge();
-            vTaskDelay(pdMS_TO_TICKS(300));
+            charge->ReadBatteryData();
+            vTaskDelay(pdMS_TO_TICKS(1000));  // 每秒读取一次
         }
     }
 
 private:
     uint8_t* read_buffer_ = nullptr;
+    uint8_t battery_level_ = 0;   // 电量百分比
+    uint16_t voltage_ = 0;        // 电压 (mV)
+    int16_t current_ = 0;         // 电流 (mA)
 };
 
 class Cst816s : public I2cDevice {
@@ -660,6 +705,16 @@ public:
 
     virtual Camera* GetCamera() override {
         return camera_;
+    }
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        if (charge_ == nullptr) {
+            return false;
+        }
+        level = charge_->GetBatteryLevel();
+        charging = charge_->IsCharging();
+        discharging = charge_->IsDischarging();
+        return true;
     }
 };
 
