@@ -716,6 +716,18 @@ public:
         discharging = charge_->IsDischarging();
         return true;
     }
+
+    virtual bool GetBatteryDetail(int& level, bool& charging, bool& discharging, int& voltage_mv, int& current_ma) override {
+        if (charge_ == nullptr) {
+            return false;
+        }
+        level = charge_->GetBatteryLevel();
+        charging = charge_->IsCharging();
+        discharging = charge_->IsDischarging();
+        voltage_mv = charge_->GetVoltage();
+        current_ma = charge_->GetCurrent();
+        return true;
+    }
 };
 
 DECLARE_BOARD(EchoEar);

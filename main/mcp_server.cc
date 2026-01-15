@@ -52,6 +52,34 @@ void McpServer::AddCommonTools() {
             return board.GetDeviceStatusJson();
         });
 
+    int level = 0;
+    int voltage_mv = 0;
+    int current_ma = 0;
+    bool charging = false;
+    bool discharging = false;
+    if (board.GetBatteryDetail(level, charging, discharging, voltage_mv, current_ma)) {
+        AddTool("self.get_battery_detail",
+            "Get the battery level, voltage, current, and charging status.",
+            PropertyList(),
+            [&board](const PropertyList& properties) -> ReturnValue {
+                int level = 0;
+                int voltage_mv = 0;
+                int current_ma = 0;
+                bool charging = false;
+                bool discharging = false;
+                if (!board.GetBatteryDetail(level, charging, discharging, voltage_mv, current_ma)) {
+                    throw std::runtime_error("Battery detail not supported");
+                }
+                cJSON* battery = cJSON_CreateObject();
+                cJSON_AddNumberToObject(battery, "level", level);
+                cJSON_AddNumberToObject(battery, "voltage_mv", voltage_mv);
+                cJSON_AddNumberToObject(battery, "current_ma", current_ma);
+                cJSON_AddBoolToObject(battery, "charging", charging);
+                cJSON_AddBoolToObject(battery, "discharging", discharging);
+                return battery;
+            });
+    }
+
     AddTool("self.audio_speaker.set_volume", 
         "Set the volume of the audio speaker. If the current volume is unknown, you must call `self.get_device_status` tool first and then call this tool.",
         PropertyList({

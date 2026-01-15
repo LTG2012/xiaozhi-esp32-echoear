@@ -49,6 +49,10 @@ bool Board::GetBatteryLevel(int &level, bool& charging, bool& discharging) {
     return false;
 }
 
+bool Board::GetBatteryDetail(int& level, bool& charging, bool& discharging, int& voltage_mv, int& current_ma) {
+    return false;
+}
+
 bool Board::GetTemperature(float& esp32temp){
     return false;
 }
