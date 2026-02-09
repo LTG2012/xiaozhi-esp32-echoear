@@ -9,14 +9,17 @@
 #include "esp32_camera.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include <driver/i2c_master.h>
 #include <driver/i2c.h>
+#include <driver/touch_sens.h>
 #include "i2c_device.h"
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_st77916.h>
 #include "esp_lcd_touch_cst816s.h"
+#include <soc/soc_caps.h>
 #include "touch.h"
 
 #include "driver/temperature_sensor.h"
@@ -303,6 +306,281 @@ private:
     int16_t current_ = 0;         // 电流 (mA)
 };
 
+#if SOC_TOUCH_SENSOR_SUPPORTED
+class CopperTouchButton {
+public:
+    CopperTouchButton() = default;
+
+    bool Initialize()
+    {
+        event_queue_ = xQueueCreate(kEventQueueLength, sizeof(TouchEvent));
+        if (event_queue_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create copper touch queue");
+            return false;
+        }
+
+        if (xTaskCreatePinnedToCore(TaskFunction, "copper_touch_task", 4 * 1024,
+                                    this, 5, &task_handle_, 1) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create copper touch task");
+            Deinitialize();
+            return false;
+        }
+
+        static touch_sensor_sample_config_t sample_cfg[TOUCH_SAMPLE_CFG_NUM] = {
+#if SOC_TOUCH_SENSOR_VERSION == 2
+            TOUCH_SENSOR_V2_DEFAULT_SAMPLE_CONFIG(
+                500, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V2),
+#else
+#error "EchoEar copper touch implementation currently targets touch sensor v2"
+#endif
+        };
+
+        touch_sensor_config_t sens_cfg =
+            TOUCH_SENSOR_DEFAULT_BASIC_CONFIG(TOUCH_SAMPLE_CFG_NUM, sample_cfg);
+        if (touch_sensor_new_controller(&sens_cfg, &sens_handle_) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create copper touch controller");
+            Deinitialize();
+            return false;
+        }
+
+        touch_channel_config_t chan_cfg = {};
+#if SOC_TOUCH_SENSOR_VERSION == 2
+        chan_cfg.active_thresh[0] = 2000;
+        chan_cfg.charge_speed = TOUCH_CHARGE_SPEED_7;
+        chan_cfg.init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT;
+#endif
+        if (touch_sensor_new_channel(sens_handle_, TOUCH_PAD1, &chan_cfg,
+                                     &chan_handle_) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create copper touch channel");
+            Deinitialize();
+            return false;
+        }
+
+        touch_sensor_filter_config_t filter_cfg =
+            TOUCH_SENSOR_DEFAULT_FILTER_CONFIG();
+        filter_cfg.data.debounce_cnt = 4;
+        filter_cfg.data.active_hysteresis = 8;
+        if (touch_sensor_config_filter(sens_handle_, &filter_cfg) != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to configure copper touch filter");
+        }
+
+        if (touch_sensor_enable(sens_handle_) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to enable copper touch controller");
+            Deinitialize();
+            return false;
+        }
+        enabled_ = true;
+
+        for (int i = 0; i < kCalibrationScanTimes; ++i) {
+            if (touch_sensor_trigger_oneshot_scanning(sens_handle_, 1000) != ESP_OK) {
+                ESP_LOGE(TAG, "Copper touch calibration scan failed");
+                Deinitialize();
+                return false;
+            }
+        }
+
+        uint32_t baseline[TOUCH_SAMPLE_CFG_NUM] = {0};
+        touch_chan_data_type_t baseline_type = TOUCH_CHAN_DATA_TYPE_SMOOTH;
+#if SOC_TOUCH_SUPPORT_BENCHMARK
+        baseline_type = TOUCH_CHAN_DATA_TYPE_BENCHMARK;
+#endif
+        if (touch_channel_read_data(chan_handle_, baseline_type, baseline) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read copper touch baseline");
+            Deinitialize();
+            return false;
+        }
+
+        if (touch_sensor_disable(sens_handle_) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to disable copper touch controller");
+            Deinitialize();
+            return false;
+        }
+        enabled_ = false;
+
+        for (int i = 0; i < TOUCH_SAMPLE_CFG_NUM; ++i) {
+            uint32_t dynamic_thresh = baseline[i] / kThresholdDivisor;
+            if (dynamic_thresh < kMinThreshold) {
+                dynamic_thresh = kMinThreshold;
+            }
+            chan_cfg.active_thresh[i] = dynamic_thresh;
+        }
+
+        if (touch_sensor_reconfig_channel(chan_handle_, &chan_cfg) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to reconfigure copper touch threshold");
+            Deinitialize();
+            return false;
+        }
+
+        touch_event_callbacks_t callbacks = {
+            .on_active = OnTouchActive,
+            .on_inactive = OnTouchInactive,
+        };
+        if (touch_sensor_register_callbacks(sens_handle_, &callbacks, this) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register copper touch callbacks");
+            Deinitialize();
+            return false;
+        }
+
+        if (touch_sensor_enable(sens_handle_) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to enable copper touch controller (final)");
+            Deinitialize();
+            return false;
+        }
+        enabled_ = true;
+
+        if (touch_sensor_start_continuous_scanning(sens_handle_) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start copper touch scanning");
+            Deinitialize();
+            return false;
+        }
+        scanning_ = true;
+
+        ESP_LOGI(TAG, "Copper touch enabled on GPIO%d (channel %d)", TOUCH_PAD1,
+                 TOUCH_PAD1);
+        return true;
+    }
+
+    void Deinitialize()
+    {
+        if (sens_handle_ != nullptr) {
+            if (scanning_) {
+                touch_sensor_stop_continuous_scanning(sens_handle_);
+                scanning_ = false;
+            }
+            if (enabled_) {
+                touch_sensor_disable(sens_handle_);
+                enabled_ = false;
+            }
+            if (chan_handle_ != nullptr) {
+                touch_sensor_del_channel(chan_handle_);
+                chan_handle_ = nullptr;
+            }
+            touch_sensor_del_controller(sens_handle_);
+            sens_handle_ = nullptr;
+        }
+
+        if (task_handle_ != nullptr) {
+            vTaskDelete(task_handle_);
+            task_handle_ = nullptr;
+        }
+
+        if (event_queue_ != nullptr) {
+            vQueueDelete(event_queue_);
+            event_queue_ = nullptr;
+        }
+    }
+
+private:
+    enum class TouchEventType : uint8_t {
+        kActive,
+        kInactive,
+    };
+
+    struct TouchEvent {
+        TouchEventType type;
+    };
+
+    static bool OnTouchActive(touch_sensor_handle_t sens_handle,
+                              const touch_active_event_data_t* event,
+                              void* user_ctx)
+    {
+        (void)sens_handle;
+        (void)event;
+        auto* self = static_cast<CopperTouchButton*>(user_ctx);
+        return self != nullptr && self->PostEventFromIsr(TouchEventType::kActive);
+    }
+
+    static bool OnTouchInactive(touch_sensor_handle_t sens_handle,
+                                const touch_inactive_event_data_t* event,
+                                void* user_ctx)
+    {
+        (void)sens_handle;
+        (void)event;
+        auto* self = static_cast<CopperTouchButton*>(user_ctx);
+        return self != nullptr &&
+               self->PostEventFromIsr(TouchEventType::kInactive);
+    }
+
+    bool PostEventFromIsr(TouchEventType type)
+    {
+        if (event_queue_ == nullptr) {
+            return false;
+        }
+        TouchEvent event = {.type = type};
+        BaseType_t higher_priority_task_woken = pdFALSE;
+        xQueueSendFromISR(event_queue_, &event, &higher_priority_task_woken);
+        return higher_priority_task_woken == pdTRUE;
+    }
+
+    static void TaskFunction(void* arg)
+    {
+        auto* self = static_cast<CopperTouchButton*>(arg);
+        if (self == nullptr || self->event_queue_ == nullptr) {
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        TouchEvent event = {};
+        while (xQueueReceive(self->event_queue_, &event, portMAX_DELAY) == pdTRUE) {
+            self->HandleEvent(event);
+        }
+    }
+
+    void HandleEvent(const TouchEvent& event)
+    {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (event.type == TouchEventType::kActive) {
+            if (!is_pressed_) {
+                is_pressed_ = true;
+                press_start_ms_ = now_ms;
+            }
+            return;
+        }
+
+        if (!is_pressed_) {
+            return;
+        }
+        is_pressed_ = false;
+
+        int64_t press_duration_ms = now_ms - press_start_ms_;
+        if (press_duration_ms < kMinPressMs || press_duration_ms > kMaxPressMs) {
+            return;
+        }
+        if (now_ms - last_trigger_ms_ < kTriggerCooldownMs) {
+            return;
+        }
+
+        auto& app = Application::GetInstance();
+        auto state = app.GetDeviceState();
+        if (state == kDeviceStateIdle || state == kDeviceStateListening ||
+            state == kDeviceStateSpeaking) {
+            last_trigger_ms_ = now_ms;
+            app.ToggleChatState();
+            ESP_LOGI(TAG, "Copper touch toggled chat state (state=%d)", state);
+        }
+    }
+
+    static constexpr int kCalibrationScanTimes = 5;
+    static constexpr uint32_t kThresholdDivisor = 40;  // baseline / 40 = 2.5%
+    static constexpr uint32_t kMinThreshold = 800;
+    static constexpr int kEventQueueLength = 8;
+    static constexpr int64_t kMinPressMs = 45;
+    static constexpr int64_t kMaxPressMs = 1200;
+    static constexpr int64_t kTriggerCooldownMs = 700;
+
+    touch_sensor_handle_t sens_handle_ = nullptr;
+    touch_channel_handle_t chan_handle_ = nullptr;
+    QueueHandle_t event_queue_ = nullptr;
+    TaskHandle_t task_handle_ = nullptr;
+
+    bool enabled_ = false;
+    bool scanning_ = false;
+    bool is_pressed_ = false;
+    int64_t press_start_ms_ = 0;
+    int64_t last_trigger_ms_ = 0;
+};
+#endif  // SOC_TOUCH_SENSOR_SUPPORTED
+
 class Cst816s : public I2cDevice {
 public:
     struct TouchPoint_t {
@@ -430,6 +708,9 @@ private:
     i2c_master_bus_handle_t i2c_bus_;
     Cst816s* cst816s_;
     Charge* charge_;
+#if SOC_TOUCH_SENSOR_SUPPORTED
+    CopperTouchButton* copper_touch_button_ = nullptr;
+#endif
     Button boot_button_;
     Display* display_ = nullptr;
     PwmBacklight* backlight_ = nullptr;
@@ -555,6 +836,22 @@ private:
         gpio_isr_handler_add(TP_PIN_NUM_INT, EchoEar::touch_isr_callback, cst816s_);
     }
 
+    void InitializeCopperTouchPad()
+    {
+#if SOC_TOUCH_SENSOR_SUPPORTED
+        if (TOUCH_PAD1 == GPIO_NUM_NC) {
+            ESP_LOGI(TAG, "Copper touch is not configured");
+            return;
+        }
+        copper_touch_button_ = new CopperTouchButton();
+        if (!copper_touch_button_->Initialize()) {
+            ESP_LOGW(TAG, "Failed to initialize copper touch");
+            delete copper_touch_button_;
+            copper_touch_button_ = nullptr;
+        }
+#endif
+    }
+
     void InitializeSpi()
     {
         const spi_bus_config_t bus_config = TAIJIPI_ST77916_PANEL_BUS_QSPI_CONFIG(QSPI_PIN_NUM_LCD_PCLK,
@@ -661,6 +958,7 @@ public:
         uint8_t pcb_verison = DetectPcbVersion();
         InitializeCharge();
         InitializeCst816sTouchPad();
+        InitializeCopperTouchPad();
 
         InitializeSpi();
         Initializest77916Display(pcb_verison);
