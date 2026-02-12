@@ -948,7 +948,17 @@ if ("${size}" AND "${offset}")
         set(ASSETS_PARTITION "assets")
         set(ASSETS_FILE "${CMAKE_BINARY_DIR}/${ASSETS_NAME}.bin")
 
-        build_speaker_assets_bin("${ASSETS_PARTITION}" ${EMOTE_RESOLUTION} ${ASSETS_FILE} ${CONFIG_MMAP_FILE_NAME_LENGTH})
+        # Emote assets include long file names (for example: font_puhui_common_20_4.bin).
+        # If name length is too small, files get truncated in the mmap table and runtime lookup fails.
+        set(EMOTE_ASSET_NAME_LENGTH ${CONFIG_MMAP_FILE_NAME_LENGTH})
+        if(EMOTE_ASSET_NAME_LENGTH LESS 26)
+            message(WARNING
+                "CONFIG_MMAP_FILE_NAME_LENGTH=${EMOTE_ASSET_NAME_LENGTH} is too small for emote assets; "
+                "using 32 for expression assets build.")
+            set(EMOTE_ASSET_NAME_LENGTH 32)
+        endif()
+
+        build_speaker_assets_bin("${ASSETS_PARTITION}" ${EMOTE_RESOLUTION} ${ASSETS_FILE} ${EMOTE_ASSET_NAME_LENGTH})
         message(STATUS "Generated emote assets: ${ASSETS_FILE} -> ${ASSETS_PARTITION} partition")
         esptool_py_flash_to_partition(flash "${ASSETS_PARTITION}" "${ASSETS_FILE}")
     elseif(CONFIG_FLASH_NONE_ASSETS)

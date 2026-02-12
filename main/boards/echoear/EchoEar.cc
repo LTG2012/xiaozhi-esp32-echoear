@@ -9,6 +9,7 @@
 #include "esp32_camera.h"
 
 #include <esp_log.h>
+#include <esp_err.h>
 
 #include <driver/i2c_master.h>
 #include <driver/i2c.h>
@@ -233,55 +234,81 @@ public:
         delete[] read_buffer_;
     }
 
-    // 读取电池数据：电压、电流、电量
+    // 鐠囪褰囬悽鍨潨閺佺増宓侀敍姘辨暩閸樺鈧胶鏁稿ù浣碘偓浣烘暩闁?
     void ReadBatteryData()
     {
-        // 读取电压 (0x08-0x09)
-        ReadRegs(0x08, read_buffer_, 2);
+        // 鐠囪褰囬悽闈涘竾 (0x08-0x09)
+        esp_err_t ret = TryReadRegs(0x08, read_buffer_, 2);
+        if (ret != ESP_OK) {
+            LogReadError("voltage", 0x08, ret);
+            return;
+        }
         voltage_ = static_cast<uint16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
 
-        // 读取电流 (0x0C-0x0D)
-        ReadRegs(0x0C, read_buffer_, 2);
+        // 鐠囪褰囬悽鍨ウ (0x0C-0x0D)
+        ret = TryReadRegs(0x0C, read_buffer_, 2);
+        if (ret != ESP_OK) {
+            LogReadError("current", 0x0C, ret);
+            return;
+        }
         current_ = static_cast<int16_t>(read_buffer_[1] << 8 | read_buffer_[0]);
 
-        // 读取电量百分比 SOC (0x2C-0x2D)
-        ReadRegs(0x2C, read_buffer_, 2);
-        battery_level_ = read_buffer_[0];  // SOC 低字节就是百分比
+        // 鐠囪褰囬悽鐢稿櫤閻ф儳鍨庡В?SOC (0x2C-0x2D)
+        ret = TryReadRegs(0x2C, read_buffer_, 2);
+        if (ret != ESP_OK) {
+            LogReadError("soc", 0x2C, ret);
+            return;
+        }
+        battery_level_ = read_buffer_[0];  // SOC 娴ｅ骸鐡ч懞鍌氭皑閺勵垳娅ㄩ崚鍡樼槷
         if (battery_level_ > 100) {
             battery_level_ = 100;
         }
 
-        // 读取温度
-        ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
+        // 鐠囪褰囧〒鈺佸
+        ret = temperature_sensor_get_celsius(temp_sensor, &tsens_value);
+        if (ret != ESP_OK) {
+            ++temp_fail_count_;
+            if (temp_fail_count_ == 1 || (temp_fail_count_ % 30) == 0) {
+                ESP_LOGW(TAG, "Temperature read failed: %s (fail_count=%lu)",
+                    esp_err_to_name(ret), static_cast<unsigned long>(temp_fail_count_));
+            }
+        } else {
+            temp_fail_count_ = 0;
+        }
+
+        if (read_fail_count_ > 0) {
+            ESP_LOGI(TAG, "Charge I2C recovered after %lu failures", static_cast<unsigned long>(read_fail_count_));
+            read_fail_count_ = 0;
+        }
 
         ESP_LOGD(TAG, "Battery: voltage=%dmV, current=%dmA, SOC=%d%%", voltage_, current_, battery_level_);
     }
 
-    // 获取电量百分比 (0-100)
+    // 閼惧嘲褰囬悽鐢稿櫤閻ф儳鍨庡В?(0-100)
     uint8_t GetBatteryLevel()
     {
         return battery_level_;
     }
 
-    // 判断是否在充电 (电流 > 0 表示充电)
+    // 閸掋倖鏌囬弰顖氭儊閸︺劌鍘栭悽?(閻㈠灚绁?> 0 鐞涖劎銇氶崗鍛暩)
     bool IsCharging()
     {
         return current_ > 0;
     }
 
-    // 判断是否在放电 (电流 < 0 表示放电)
+    // 閸掋倖鏌囬弰顖氭儊閸︺劍鏂侀悽?(閻㈠灚绁?< 0 鐞涖劎銇氶弨鍓ф暩)
     bool IsDischarging()
     {
         return current_ < 0;
     }
 
-    // 获取电压 (mV)
+    // 閼惧嘲褰囬悽闈涘竾 (mV)
     uint16_t GetVoltage()
     {
         return voltage_;
     }
 
-    // 获取电流 (mA，正值表示充电，负值表示放电)
+    // 閼惧嘲褰囬悽鍨ウ (mA閿涘本顒滈崐鑹般€冪粈鍝勫帠閻㈢绱濈拹鐔封偓鑹般€冪粈鐑樻杹閻?
     int16_t GetCurrent()
     {
         return current_;
@@ -292,15 +319,26 @@ public:
         Charge* charge = static_cast<Charge*>(pvParameters);
         while (true) {
             charge->ReadBatteryData();
-            vTaskDelay(pdMS_TO_TICKS(1000));  // 每秒读取一次
+            vTaskDelay(pdMS_TO_TICKS(1000));  // 濮ｅ繒顫楃拠璇插絿娑撯偓濞?
         }
     }
 
 private:
+    void LogReadError(const char* field, uint8_t reg, esp_err_t err)
+    {
+        ++read_fail_count_;
+        if (read_fail_count_ == 1 || (read_fail_count_ % 30) == 0) {
+            ESP_LOGW(TAG, "Charge read failed (%s, reg=0x%02X): %s (fail_count=%lu)",
+                field, reg, esp_err_to_name(err), static_cast<unsigned long>(read_fail_count_));
+        }
+    }
+
     uint8_t* read_buffer_ = nullptr;
-    uint8_t battery_level_ = 0;   // 电量百分比
-    uint16_t voltage_ = 0;        // 电压 (mV)
-    int16_t current_ = 0;         // 电流 (mA)
+    uint8_t battery_level_ = 0;   // 閻㈢敻鍣洪惂鎯у瀻濮?
+    uint16_t voltage_ = 0;        // 閻㈤潧甯?(mV)
+    int16_t current_ = 0;         // 閻㈠灚绁?(mA)
+    uint32_t read_fail_count_ = 0;
+    uint32_t temp_fail_count_ = 0;
 };
 
 class Cst816s : public I2cDevice {
@@ -342,12 +380,30 @@ public:
         }
     }
 
-    void UpdateTouchPoint()
+    bool UpdateTouchPoint()
     {
-        ReadRegs(0x02, read_buffer_, 6);
+        esp_err_t ret = TryReadRegs(0x02, read_buffer_, 6);
+        if (ret != ESP_OK) {
+            ++read_fail_count_;
+            if (read_fail_count_ == 1 || (read_fail_count_ % 30) == 0) {
+                ESP_LOGW(TAG, "Touch read failed: %s (fail_count=%lu)",
+                    esp_err_to_name(ret), static_cast<unsigned long>(read_fail_count_));
+            }
+            tp_.num = 0;
+            tp_.x = -1;
+            tp_.y = -1;
+            return false;
+        }
+
+        if (read_fail_count_ > 0) {
+            ESP_LOGI(TAG, "Touch I2C recovered after %lu failures", static_cast<unsigned long>(read_fail_count_));
+            read_fail_count_ = 0;
+        }
+
         tp_.num = read_buffer_[0] & 0x0F;
         tp_.x = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
         tp_.y = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
+        return true;
     }
 
     const TouchPoint_t &GetTouchPoint()
@@ -423,13 +479,14 @@ private:
 
     // Touch interrupt semaphore
     SemaphoreHandle_t touch_isr_mux_;
+    uint32_t read_fail_count_ = 0;
 };
 
 class EchoEar : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
-    Cst816s* cst816s_;
-    Charge* charge_;
+    Cst816s* cst816s_ = nullptr;
+    Charge* charge_ = nullptr;
     Button boot_button_;
     Display* display_ = nullptr;
     PwmBacklight* backlight_ = nullptr;
@@ -494,6 +551,22 @@ private:
         return pcb_verison;
     }
 
+    bool ProbeI2cDevice(uint8_t address, const char* device_name)
+    {
+        constexpr int kProbeAttempts = 3;
+        esp_err_t ret = ESP_FAIL;
+        for (int i = 0; i < kProbeAttempts; ++i) {
+            ret = i2c_master_probe(i2c_bus_, address, 100);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "%s detected at I2C address 0x%02X", device_name, address);
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        ESP_LOGW(TAG, "%s not detected at I2C address 0x%02X: %s", device_name, address, esp_err_to_name(ret));
+        return false;
+    }
+
     static void touch_isr_callback(void* arg)
     {
         Cst816s* touchpad = static_cast<Cst816s*>(arg);
@@ -517,7 +590,9 @@ private:
                 auto &board = (EchoEar &)Board::GetInstance();
 
                 ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
-                touchpad->UpdateTouchPoint();
+                if (!touchpad->UpdateTouchPoint()) {
+                    continue;
+                }
                 auto touch_event = touchpad->CheckTouchEvent();
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
@@ -533,12 +608,20 @@ private:
 
     void InitializeCharge()
     {
+        if (!ProbeI2cDevice(0x55, "Charge IC")) {
+            ESP_LOGW(TAG, "Battery measurement disabled");
+            return;
+        }
         charge_ = new Charge(i2c_bus_, 0x55);
         xTaskCreatePinnedToCore(Charge::TaskFunction, "batterydecTask", 3 * 1024, charge_, 6, NULL, 0);
     }
 
     void InitializeCst816sTouchPad()
     {
+        if (!ProbeI2cDevice(0x15, "Touch IC")) {
+            ESP_LOGW(TAG, "Touch input disabled");
+            return;
+        }
         cst816s_ = new Cst816s(i2c_bus_, 0x15);
 
         xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5, NULL, 1);
