@@ -29,3 +29,6 @@ CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1536
 
 # LVGL Graphics
 CONFIG_LV_USE_SNAPSHOT=y
+
+# Emote assets contain file names longer than the esp-mmap-assets default.
+CONFIG_MMAP_FILE_NAME_LENGTH=32
