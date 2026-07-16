@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 #include <esp_network.h>
 #include <esp_log.h>
+#include <esp_mac.h>
 #include <utility>
 
 #include <font_awesome.h>
@@ -56,20 +57,27 @@ void WifiBoard::StartNetwork() {
     WifiManagerConfig config;
     config.ssid_prefix = "Xiaozhi";
     config.language = Lang::CODE;
+    // Set a DHCP hostname so the router shows a friendly name instead of "espressif".
+    // Uses the same "<prefix>-<last 2 MAC bytes>" scheme as the config AP SSID.
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        char hostname[32];
+        snprintf(hostname, sizeof(hostname), "%s-%02X%02X", config.ssid_prefix.c_str(), mac[4], mac[5]);
+        config.station_hostname = hostname;
+    }
     wifi_manager.Initialize(config);
 
     // Set unified event callback - forward to NetworkEvent with SSID data
-    wifi_manager.SetEventCallback([this, &wifi_manager](WifiEvent event) {
-        std::string ssid = wifi_manager.GetSsid();
+    wifi_manager.SetEventCallback([this](WifiEvent event, const std::string& data) {
         switch (event) {
             case WifiEvent::Scanning:
                 OnNetworkEvent(NetworkEvent::Scanning);
                 break;
             case WifiEvent::Connecting:
-                OnNetworkEvent(NetworkEvent::Connecting, ssid);
+                OnNetworkEvent(NetworkEvent::Connecting, data);
                 break;
             case WifiEvent::Connected:
-                OnNetworkEvent(NetworkEvent::Connected, ssid);
+                OnNetworkEvent(NetworkEvent::Connected, data);
                 break;
             case WifiEvent::Disconnected:
                 OnNetworkEvent(NetworkEvent::Disconnected);
@@ -175,8 +183,7 @@ void WifiBoard::StartWifiConfigMode() {
 
         Application::GetInstance().Alert(Lang::Strings::WIFI_CONFIG_MODE, hint.c_str(), "gear", Lang::Sounds::OGG_WIFICONFIG);
     });
-#endif
-#if CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
+#elif CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
     auto &blufi = Blufi::GetInstance();
     // initialize esp-blufi protocol
     blufi.init();
