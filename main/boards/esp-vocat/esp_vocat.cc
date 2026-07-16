@@ -9,6 +9,7 @@
 #include "esp_video.h"
 
 #include <esp_log.h>
+#include <esp_err.h>
 #include <esp_timer.h>
 #include "esp_idf_version.h"
 #include <cinttypes>
@@ -276,6 +277,14 @@ class EspVocat;
 
 class Charge : public I2cDevice {
 public:
+    struct BatteryInfo {
+        int level = 0;
+        bool charging = false;
+        bool discharging = false;
+        int voltage_mv = 0;
+        int current_ma = 0;
+    };
+
     static constexpr uint8_t kRegVoltage = 0x08;
     static constexpr uint8_t kRegBatteryStatus = 0x0A;
     static constexpr uint8_t kRegCurrent = 0x0C;
@@ -284,63 +293,92 @@ public:
     static constexpr int kChargingCurrentMa = 30;
     static constexpr uint16_t kBatteryStatusDsg = BIT0;
 
-    Charge(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
+    Charge(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr) {}
+
+    bool GetBatteryInfo(BatteryInfo& info)
     {
-        read_buffer_ = new uint8_t[8];
-    }
-    ~Charge()
-    {
-        delete[] read_buffer_;
+        taskENTER_CRITICAL(&data_lock_);
+        const bool valid = data_valid_;
+        info = battery_info_;
+        taskEXIT_CRITICAL(&data_lock_);
+        return valid;
     }
 
-    int16_t ReadWord(uint8_t reg)
+    bool Update()
     {
-        uint8_t data[2] = {0};
-        ReadRegs(reg, data, 2);
-        return static_cast<int16_t>(static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8));
-    }
-
-    int GetBatteryLevel()
-    {
-        int level = ReadWord(kRegStateOfCharge);
-        if (level < 0) {
-            return 0;
-        }
-        if (level > 100) {
-            return 100;
-        }
-        return level;
-    }
-
-    bool IsCharging()
-    {
-        const uint16_t status = static_cast<uint16_t>(ReadWord(kRegBatteryStatus));
-        if ((status & kBatteryStatusDsg) == 0) {
-            return true;
+        int16_t voltage = 0;
+        int16_t current = 0;
+        int16_t state_of_charge = 0;
+        int16_t status = 0;
+        int16_t average_current = 0;
+        if (!TryReadWord(kRegVoltage, voltage, "voltage") ||
+            !TryReadWord(kRegCurrent, current, "current") ||
+            !TryReadWord(kRegStateOfCharge, state_of_charge, "state of charge") ||
+            !TryReadWord(kRegBatteryStatus, status, "battery status") ||
+            !TryReadWord(kRegAverageCurrent, average_current, "average current")) {
+            return false;
         }
 
-        const int16_t avg_current_ma = ReadWord(kRegAverageCurrent);
-        const int16_t current_ma = ReadWord(kRegCurrent);
-        // Current is a fallback only: AverageCurrent can lag charger insertion noticeably.
-        return avg_current_ma > kChargingCurrentMa || current_ma > kChargingCurrentMa;
-    }
+        BatteryInfo info;
+        info.level = state_of_charge;
+        if (info.level < 0) {
+            info.level = 0;
+        } else if (info.level > 100) {
+            info.level = 100;
+        }
+        info.voltage_mv = static_cast<uint16_t>(voltage);
+        info.current_ma = current;
+        info.discharging = (static_cast<uint16_t>(status) & kBatteryStatusDsg) != 0;
+        info.charging = !info.discharging || average_current > kChargingCurrentMa || current > kChargingCurrentMa;
 
-    bool IsDischarging()
-    {
-        return (static_cast<uint16_t>(ReadWord(kRegBatteryStatus)) & kBatteryStatusDsg) != 0;
-    }
+        taskENTER_CRITICAL(&data_lock_);
+        battery_info_ = info;
+        data_valid_ = true;
+        taskEXIT_CRITICAL(&data_lock_);
 
-    void Update()
-    {
-        const int16_t voltage = ReadWord(kRegVoltage);
-        const int16_t current = ReadWord(kRegCurrent);
-        ESP_ERROR_CHECK(temperature_sensor_get_celsius(temp_sensor, &tsens_value));
-        (void)voltage;
-        (void)current;
+        const esp_err_t temperature_ret = temperature_sensor_get_celsius(temp_sensor, &tsens_value);
+        if (temperature_ret != ESP_OK) {
+            ++temperature_fail_count_;
+            if (temperature_fail_count_ == 1 || (temperature_fail_count_ % 30) == 0) {
+                ESP_LOGW(TAG, "Temperature read failed: %s (fail_count=%lu)",
+                         esp_err_to_name(temperature_ret), static_cast<unsigned long>(temperature_fail_count_));
+            }
+        } else {
+            temperature_fail_count_ = 0;
+        }
+
+        if (read_fail_count_ > 0) {
+            ESP_LOGI(TAG, "Charge I2C recovered after %lu failures", static_cast<unsigned long>(read_fail_count_));
+            read_fail_count_ = 0;
+        }
+        ESP_LOGD(TAG, "Battery: voltage=%dmV, current=%dmA, SOC=%d%%",
+                 info.voltage_mv, info.current_ma, info.level);
+        return true;
     }
 
 private:
-    uint8_t* read_buffer_ = nullptr;
+    bool TryReadWord(uint8_t reg, int16_t& value, const char* field)
+    {
+        uint8_t data[2] = {0};
+        const esp_err_t ret = TryReadRegs(reg, data, sizeof(data));
+        if (ret != ESP_OK) {
+            ++read_fail_count_;
+            if (read_fail_count_ == 1 || (read_fail_count_ % 30) == 0) {
+                ESP_LOGW(TAG, "Charge read failed (%s, reg=0x%02X): %s (fail_count=%lu)",
+                         field, reg, esp_err_to_name(ret), static_cast<unsigned long>(read_fail_count_));
+            }
+            return false;
+        }
+        value = static_cast<int16_t>(static_cast<uint16_t>(data[0]) |
+                                     (static_cast<uint16_t>(data[1]) << 8));
+        return true;
+    }
+
+    portMUX_TYPE data_lock_ = portMUX_INITIALIZER_UNLOCKED;
+    BatteryInfo battery_info_;
+    bool data_valid_ = false;
+    uint32_t read_fail_count_ = 0;
+    uint32_t temperature_fail_count_ = 0;
 };
 
 class Cst816s : public I2cDevice {
@@ -382,12 +420,29 @@ public:
         }
     }
 
-    void UpdateTouchPoint()
+    bool UpdateTouchPoint()
     {
-        ReadRegs(0x02, read_buffer_, 6);
+        const esp_err_t ret = TryReadRegs(0x02, read_buffer_, 6);
+        if (ret != ESP_OK) {
+            ++read_fail_count_;
+            if (read_fail_count_ == 1 || (read_fail_count_ % 30) == 0) {
+                ESP_LOGW(TAG, "Touch read failed: %s (fail_count=%lu)",
+                         esp_err_to_name(ret), static_cast<unsigned long>(read_fail_count_));
+            }
+            tp_.num = 0;
+            tp_.x = -1;
+            tp_.y = -1;
+            return false;
+        }
+
+        if (read_fail_count_ > 0) {
+            ESP_LOGI(TAG, "Touch I2C recovered after %lu failures", static_cast<unsigned long>(read_fail_count_));
+            read_fail_count_ = 0;
+        }
         tp_.num = read_buffer_[0] & 0x0F;
         tp_.x = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
         tp_.y = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
+        return true;
     }
 
     const TouchPoint_t &GetTouchPoint()
@@ -463,14 +518,15 @@ private:
 
     // Touch interrupt semaphore
     SemaphoreHandle_t touch_isr_mux_;
+    uint32_t read_fail_count_ = 0;
 };
 
 class EspVocat : public WifiBoard {
 private:
-    i2c_master_bus_handle_t i2c_bus_;
+    i2c_master_bus_handle_t i2c_bus_ = nullptr;
     i2c_bus_handle_t shared_i2c_bus_handle_ = nullptr;
-    Cst816s* cst816s_;
-    Charge* charge_;
+    Cst816s* cst816s_ = nullptr;
+    Charge* charge_ = nullptr;
     Button boot_button_;
     Display* display_ = nullptr;
     PwmBacklight* backlight_ = nullptr;
@@ -553,8 +609,12 @@ private:
             return;
         }
 
-        const int level = charge_->GetBatteryLevel();
-        const bool charging = charge_->IsCharging();
+        Charge::BatteryInfo battery_info;
+        if (!charge_->GetBatteryInfo(battery_info)) {
+            return;
+        }
+        const int level = battery_info.level;
+        const bool charging = battery_info.charging;
 
         if (charging && !was_charging_) {
             PlayBatteryEmotion("battery_connected", 4000);
@@ -601,8 +661,9 @@ private:
         auto* self = static_cast<EspVocat*>(arg);
         while (true) {
             if (self != nullptr && self->charge_ != nullptr) {
-                self->charge_->Update();
-                self->HandleBatteryEmotions();
+                if (self->charge_->Update()) {
+                    self->HandleBatteryEmotions();
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(300));
         }
@@ -715,6 +776,23 @@ private:
             return pcb_version;
         }
 
+    bool ProbeI2cDevice(uint8_t address, const char* device_name)
+    {
+        constexpr int kProbeAttempts = 3;
+        esp_err_t ret = ESP_FAIL;
+        for (int i = 0; i < kProbeAttempts; ++i) {
+            ret = i2c_master_probe(i2c_bus_, address, 100);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "%s detected at I2C address 0x%02X", device_name, address);
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        ESP_LOGW(TAG, "%s not detected at I2C address 0x%02X: %s",
+                 device_name, address, esp_err_to_name(ret));
+        return false;
+    }
+
     static void touch_isr_callback(void* arg)
     {
         Cst816s* touchpad = static_cast<Cst816s*>(arg);
@@ -738,7 +816,9 @@ private:
                 auto &board = (EspVocat &)Board::GetInstance();
 
                 ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
-                touchpad->UpdateTouchPoint();
+                if (!touchpad->UpdateTouchPoint()) {
+                    continue;
+                }
                 auto touch_event = touchpad->CheckTouchEvent();
 
                 if (touch_event == Cst816s::TOUCH_RELEASE) {
@@ -754,13 +834,20 @@ private:
 
     void InitializeCharge()
     {
+        if (!ProbeI2cDevice(0x55, "Charge IC")) {
+            ESP_LOGW(TAG, "Battery measurement disabled");
+            return;
+        }
         charge_ = new Charge(i2c_bus_, 0x55);
-        was_charging_ = charge_->IsCharging();
         xTaskCreatePinnedToCore(battery_task, "batteryTask", 3 * 1024, this, 6, &charge_task_handle_, 0);
     }
 
     void InitializeCst816sTouchPad()
     {
+        if (!ProbeI2cDevice(0x15, "Touch IC")) {
+            ESP_LOGW(TAG, "Touch input disabled");
+            return;
+        }
         cst816s_ = new Cst816s(i2c_bus_, 0x15);
 
         xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5, &touch_task_handle_, 1);
@@ -1140,12 +1227,29 @@ public:
     }
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        Charge::BatteryInfo battery_info;
         if (charge_ == nullptr) {
             return false;
         }
-        level = charge_->GetBatteryLevel();
-        charging = charge_->IsCharging();
-        discharging = charge_->IsDischarging();
+        charge_->GetBatteryInfo(battery_info);
+        level = battery_info.level;
+        charging = battery_info.charging;
+        discharging = battery_info.discharging;
+        return true;
+    }
+
+    virtual bool GetBatteryDetail(int& level, bool& charging, bool& discharging,
+                                  int& voltage_mv, int& current_ma) override {
+        Charge::BatteryInfo battery_info;
+        if (charge_ == nullptr) {
+            return false;
+        }
+        charge_->GetBatteryInfo(battery_info);
+        level = battery_info.level;
+        charging = battery_info.charging;
+        discharging = battery_info.discharging;
+        voltage_mv = battery_info.voltage_mv;
+        current_ma = battery_info.current_ma;
         return true;
     }
 };
