@@ -15,6 +15,7 @@
 #include <cinttypes>
 
 #include <driver/i2c_master.h>
+#include <driver/usb_serial_jtag.h>
 #include <cstdlib>
 #include "i2c_device.h"
 #include "i2c_bus.h"
@@ -286,12 +287,8 @@ public:
     };
 
     static constexpr uint8_t kRegVoltage = 0x08;
-    static constexpr uint8_t kRegBatteryStatus = 0x0A;
     static constexpr uint8_t kRegCurrent = 0x0C;
     static constexpr uint8_t kRegStateOfCharge = 0x2C;
-    static constexpr uint8_t kRegAverageCurrent = 0x14;
-    static constexpr int kChargingCurrentMa = 30;
-    static constexpr uint16_t kBatteryStatusDsg = BIT0;
 
     Charge(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr) {}
 
@@ -309,13 +306,9 @@ public:
         int16_t voltage = 0;
         int16_t current = 0;
         int16_t state_of_charge = 0;
-        int16_t status = 0;
-        int16_t average_current = 0;
         if (!TryReadWord(kRegVoltage, voltage, "voltage") ||
             !TryReadWord(kRegCurrent, current, "current") ||
-            !TryReadWord(kRegStateOfCharge, state_of_charge, "state of charge") ||
-            !TryReadWord(kRegBatteryStatus, status, "battery status") ||
-            !TryReadWord(kRegAverageCurrent, average_current, "average current")) {
+            !TryReadWord(kRegStateOfCharge, state_of_charge, "state of charge")) {
             return false;
         }
 
@@ -328,8 +321,8 @@ public:
         }
         info.voltage_mv = static_cast<uint16_t>(voltage);
         info.current_ma = current;
-        info.discharging = (static_cast<uint16_t>(status) & kBatteryStatusDsg) != 0;
-        info.charging = !info.discharging || average_current > kChargingCurrentMa || current > kChargingCurrentMa;
+        info.charging = usb_serial_jtag_is_connected();
+        info.discharging = !info.charging;
 
         taskENTER_CRITICAL(&data_lock_);
         battery_info_ = info;
@@ -616,6 +609,11 @@ private:
         const int level = battery_info.level;
         const bool charging = battery_info.charging;
 
+        if (charging != was_charging_) {
+            Application::GetInstance().Schedule([]() {
+                Board::GetInstance().GetDisplay()->UpdateStatusBar();
+            });
+        }
         if (charging && !was_charging_) {
             PlayBatteryEmotion("battery_connected", 4000);
             low_battery_alert_mask_ = 0;
