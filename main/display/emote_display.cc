@@ -1,6 +1,7 @@
 #include "emote_display.h"
 
 // Standard C++ headers
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
@@ -188,6 +189,20 @@ void EmoteDisplay::UpdateStatusBar(bool update_all)
     ESP_LOGD(TAG, "UpdateStatusBar: %s", update_all ? "true" : "false");
     if (!emote_handle_) {
         return;
+    }
+
+    int battery_level = 0;
+    bool charging = false;
+    bool discharging = false;
+    if (!Board::GetInstance().GetBatteryLevel(battery_level, charging, discharging)) {
+        return;
+    }
+
+    char battery_status[16];
+    snprintf(battery_status, sizeof(battery_status), "%d,%d", charging ? 1 : 0, battery_level);
+    const esp_err_t ret = emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_BAT, battery_status);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to update battery status: %s", esp_err_to_name(ret));
     }
 }
 
