@@ -545,6 +545,7 @@ private:
     int64_t next_low_battery_play_ms_ = 0;
     touch_slider_handle_t touch_slider_handle_ = nullptr;
     touch_button_handle_t touch_button_handle_ = nullptr;
+    bool slider_swipe_detected_ = false;
 
     static void emotion_reset_timer_callback(void* arg)
     {
@@ -902,11 +903,17 @@ private:
             ESP_LOGI(TAG, "Touch slider evt=%d data=%" PRId32, static_cast<int>(event), data);
         }
 
+        if (event == TOUCH_SLIDER_EVENT_LEFT_SWIPE || event == TOUCH_SLIDER_EVENT_RIGHT_SWIPE) {
+            self->slider_swipe_detected_ = true;
+            return;
+        }
         if (event != TOUCH_SLIDER_EVENT_RELEASE) {
             return;
         }
         constexpr int32_t kSwipeDistanceThreshold = 1000;
-        const bool is_swipe = data >= kSwipeDistanceThreshold || data <= -kSwipeDistanceThreshold;
+        const bool is_swipe = self->slider_swipe_detected_ ||
+                              data >= kSwipeDistanceThreshold || data <= -kSwipeDistanceThreshold;
+        self->slider_swipe_detected_ = false;
         self->ShowTouchFeedback(is_swipe ? "surprised" : "happy");
     }
 
