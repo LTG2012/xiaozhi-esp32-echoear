@@ -1073,6 +1073,37 @@ idf_component_register(SRCS ${SOURCES}
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 
+if(CONFIG_BOARD_TYPE_ESP_VOCAT)
+    # BMI260-family devices require a model-specific initialization image.
+    # PCB 1.0 units reporting chip ID 0x26 use the BMI220 image with the same
+    # BMI260 register driver; true BMI260 units report 0x27.
+    set(BMI260_CONFIG_B64 "${CMAKE_CURRENT_BINARY_DIR}/bmi260-init-data.b64")
+    file(DOWNLOAD
+        "https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware/+/5e3247fdbb6a8791e75d8d2aa20b30086f8b4de2/bmi260-init-data.fw?format=TEXT"
+        "${BMI260_CONFIG_B64}"
+        EXPECTED_HASH SHA256=332d86f551478c3c45a8e64faf54773ce04c583f33b8b7ed8bf509ffde49149b
+        TLS_VERIFY ON
+        STATUS BMI260_CONFIG_DOWNLOAD_STATUS)
+    list(GET BMI260_CONFIG_DOWNLOAD_STATUS 0 BMI260_CONFIG_DOWNLOAD_RESULT)
+    if(NOT BMI260_CONFIG_DOWNLOAD_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to download the BMI260 initialization image: ${BMI260_CONFIG_DOWNLOAD_STATUS}")
+    endif()
+    target_add_binary_data(${COMPONENT_LIB} "${BMI260_CONFIG_B64}" TEXT)
+
+    set(BMI220_CONFIG_HEADER_B64 "${CMAKE_CURRENT_BINARY_DIR}/bmi220-config-header.b64")
+    file(DOWNLOAD
+        "https://chromium.googlesource.com/chromiumos/platform/ec/+/83c4dbdb7b81f38f310bdecbc249d46906e938db/third_party/bmi220/accelgyro_bmi220_config_tbin.h?format=TEXT"
+        "${BMI220_CONFIG_HEADER_B64}"
+        EXPECTED_HASH SHA256=ef989c42fd58fa988c764d7cb4d826955634dd4bd71556d3b025d6111e4bbeb1
+        TLS_VERIFY ON
+        STATUS BMI220_CONFIG_DOWNLOAD_STATUS)
+    list(GET BMI220_CONFIG_DOWNLOAD_STATUS 0 BMI220_CONFIG_DOWNLOAD_RESULT)
+    if(NOT BMI220_CONFIG_DOWNLOAD_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to download the BMI220 initialization image: ${BMI220_CONFIG_DOWNLOAD_STATUS}")
+    endif()
+    target_add_binary_data(${COMPONENT_LIB} "${BMI220_CONFIG_HEADER_B64}" TEXT)
+endif()
+
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
 # If BOARD_NAME is empty, use BOARD_TYPE
 if(NOT BOARD_NAME)

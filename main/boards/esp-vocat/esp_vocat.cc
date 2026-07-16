@@ -16,9 +16,9 @@
 
 #include <driver/i2c_master.h>
 #include <cstdlib>
+#include <mbedtls/base64.h>
 #include "i2c_device.h"
 #include "i2c_bus.h"
-#include "bmi270_api.h"
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_st77916.h>
@@ -36,45 +36,245 @@ extern "C" {
 
 #define TAG "ESP-VoCat"
 
-namespace Bmi270Motion {
-static bmi270_handle_t bmi_handle_ = nullptr;
+namespace Bmi260Motion {
+extern const uint8_t kConfigBase64Start[] asm("_binary_bmi260_init_data_b64_start");
+extern const uint8_t kConfigBase64End[] asm("_binary_bmi260_init_data_b64_end");
+extern const uint8_t kBmi220ConfigHeaderBase64Start[] asm("_binary_bmi220_config_header_b64_start");
+extern const uint8_t kBmi220ConfigHeaderBase64End[] asm("_binary_bmi220_config_header_b64_end");
+
+constexpr uint8_t kI2cAddress = 0x68;
+constexpr uint8_t kChipIdRegister = 0x00;
+constexpr uint8_t kBmi220ChipId = 0x26;
+constexpr uint8_t kBmi260ChipId = 0x27;
+constexpr uint8_t kPwrConfRegister = 0x7C;
+constexpr uint8_t kPwrCtrlRegister = 0x7D;
+constexpr uint8_t kCommandRegister = 0x7E;
+constexpr uint8_t kSoftResetCommand = 0xB6;
+constexpr uint8_t kAccelConfigRegister = 0x40;
+constexpr uint8_t kAccelRangeRegister = 0x41;
+constexpr uint8_t kAccelDataRegister = 0x0C;
+constexpr uint8_t kStatusRegister = 0x03;
+constexpr uint8_t kAccelDataReady = 0x80;
+constexpr uint8_t kInitCtrlRegister = 0x59;
+constexpr uint8_t kInitAddr0Register = 0x5B;
+constexpr uint8_t kInitDataRegister = 0x5E;
+constexpr uint8_t kInternalStatusRegister = 0x21;
+constexpr uint8_t kAccelEnable = 0x04;
+constexpr uint8_t kAccelConfig100Hz = 0xA8;
+constexpr uint8_t kAccelRange2G = 0x00;
+
+struct AccelRaw {
+    int16_t x;
+    int16_t y;
+    int16_t z;
+};
+
+static i2c_bus_device_handle_t imu_device_ = nullptr;
+
+bool ReadAccelRaw(AccelRaw& accel);
+
+static esp_err_t WriteRegister(uint8_t reg, uint8_t value)
+{
+    esp_err_t ret = i2c_bus_write_byte(imu_device_, reg, value);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BMI260 write reg 0x%02X failed: %s", reg, esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+static int HexNibble(uint8_t value)
+{
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+static esp_err_t DecodeConfiguration(uint8_t chip_id, uint8_t* config, size_t config_capacity,
+                                     size_t& config_len)
+{
+    if (chip_id == kBmi260ChipId) {
+        const size_t encoded_len = kConfigBase64End - kConfigBase64Start - 1;
+        int ret = mbedtls_base64_decode(config, config_capacity, &config_len, kConfigBase64Start, encoded_len);
+        return ret == 0 ? ESP_OK : ESP_FAIL;
+    }
+
+    const size_t encoded_len = kBmi220ConfigHeaderBase64End - kBmi220ConfigHeaderBase64Start - 1;
+    const size_t source_capacity = (encoded_len / 4) * 3 + 3;
+    uint8_t* source = static_cast<uint8_t*>(malloc(source_capacity));
+    if (source == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t source_len = 0;
+    int decode_ret = mbedtls_base64_decode(source, source_capacity, &source_len,
+                                           kBmi220ConfigHeaderBase64Start, encoded_len);
+    if (decode_ret != 0) {
+        free(source);
+        return ESP_FAIL;
+    }
+
+    config_len = 0;
+    for (size_t i = 0; i + 3 < source_len && config_len < config_capacity; ++i) {
+        if (source[i] != '0' || source[i + 1] != 'x') {
+            continue;
+        }
+        int high = HexNibble(source[i + 2]);
+        int low = HexNibble(source[i + 3]);
+        if (high >= 0 && low >= 0) {
+            config[config_len++] = static_cast<uint8_t>((high << 4) | low);
+            i += 3;
+        }
+    }
+    free(source);
+    return ESP_OK;
+}
+
+static esp_err_t LoadConfiguration(uint8_t chip_id)
+{
+    constexpr size_t kConfigSize = 8192;
+    size_t config_len = 0;
+    uint8_t* config = static_cast<uint8_t*>(malloc(kConfigSize));
+    if (config == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t decode_ret = DecodeConfiguration(chip_id, config, kConfigSize, config_len);
+    if (decode_ret != ESP_OK || config_len != kConfigSize) {
+        free(config);
+        ESP_LOGW(TAG, "BMI260-family configuration decode failed: %s, size: %u", esp_err_to_name(decode_ret),
+                 static_cast<unsigned>(config_len));
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = WriteRegister(kPwrConfRegister, 0x02);
+    if (ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    if (ret == ESP_OK) {
+        ret = WriteRegister(kInitCtrlRegister, 0x00);
+    }
+    for (size_t offset = 0; ret == ESP_OK && offset < config_len; offset += 32) {
+        const size_t chunk_len = (config_len - offset) < 32 ? (config_len - offset) : 32;
+        const uint16_t init_address = static_cast<uint16_t>(offset / 2);
+        const uint8_t address[2] = {
+            static_cast<uint8_t>(init_address & 0x0F),
+            static_cast<uint8_t>(init_address >> 4),
+        };
+        ret = i2c_bus_write_bytes(imu_device_, kInitAddr0Register, sizeof(address), address);
+        if (ret == ESP_OK) {
+            ret = i2c_bus_write_bytes(imu_device_, kInitDataRegister, chunk_len, config + offset);
+        }
+    }
+    free(config);
+    if (ret != ESP_OK || WriteRegister(kInitCtrlRegister, 0x01) != ESP_OK) {
+        ESP_LOGW(TAG, "BMI260 configuration upload failed");
+        return ESP_FAIL;
+    }
+
+    uint8_t last_status = 0xFF;
+    for (int attempt = 0; attempt < 15; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (i2c_bus_read_byte(imu_device_, kInternalStatusRegister, &last_status) == ESP_OK &&
+            (last_status & 0x0F) == 0x01) {
+            ESP_LOGI(TAG, "BMI260 configuration loaded");
+            return ESP_OK;
+        }
+    }
+    ESP_LOGW(TAG, "BMI260 configuration did not reach ready state (status=0x%02X)", last_status);
+    return ESP_FAIL;
+}
 
 esp_err_t Initialize(i2c_bus_handle_t i2c_bus)
 {
-    if (bmi_handle_) {
+    if (imu_device_ != nullptr) {
         return ESP_OK;
     }
     if (!i2c_bus) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = bmi270_sensor_create(i2c_bus, &bmi_handle_, bmi270_config_file,
-                                         BMI2_GYRO_CROSS_SENS_ENABLE | BMI2_CRT_RTOSK_ENABLE);
-    if (ret != ESP_OK || !bmi_handle_) {
-        ESP_LOGW(TAG, "BMI270 init failed: %s", esp_err_to_name(ret));
-        return ret == ESP_OK ? ESP_FAIL : ret;
-    }
-
-    const uint8_t sens_list[] = {BMI2_ACCEL};
-    int8_t rslt = bmi270_sensor_enable(sens_list, 1, bmi_handle_);
-    if (rslt != BMI2_OK) {
-        ESP_LOGW(TAG, "BMI270 accel enable failed: %d", rslt);
+    imu_device_ = i2c_bus_device_create(i2c_bus, kI2cAddress, 400000);
+    if (imu_device_ == nullptr) {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "BMI270 initialized");
+    uint8_t chip_id = 0;
+    esp_err_t ret = i2c_bus_read_byte(imu_device_, kChipIdRegister, &chip_id);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BMI260 chip ID read failed: %s", esp_err_to_name(ret));
+        i2c_bus_device_delete(&imu_device_);
+        return ret;
+    }
+    // PCB v1.0 returns 0x26 even though its BOM specifies BMI260.  Accept it
+    // here, but keep the value visible in the boot log for traceability.
+    if (chip_id != kBmi260ChipId && chip_id != kBmi220ChipId) {
+        ESP_LOGW(TAG, "Unexpected IMU chip ID 0x%02X", chip_id);
+        i2c_bus_device_delete(&imu_device_);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    ESP_LOGI(TAG, "BMI260 driver detected %s at 0x%02X (chip ID 0x%02X)",
+             chip_id == kBmi220ChipId ? "BMI220-compatible IMU" : "BMI260", kI2cAddress, chip_id);
+    if (WriteRegister(kCommandRegister, kSoftResetCommand) != ESP_OK) {
+        i2c_bus_device_delete(&imu_device_);
+        return ESP_FAIL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    if (LoadConfiguration(chip_id) != ESP_OK ||
+        WriteRegister(kPwrCtrlRegister, kAccelEnable) != ESP_OK) {
+        i2c_bus_device_delete(&imu_device_);
+        return ESP_FAIL;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+    if (WriteRegister(kAccelConfigRegister, kAccelConfig100Hz) != ESP_OK ||
+        WriteRegister(kAccelRangeRegister, kAccelRange2G) != ESP_OK) {
+        i2c_bus_device_delete(&imu_device_);
+        return ESP_FAIL;
+    }
+
+    AccelRaw sample = {};
+    uint8_t status = 0;
+    bool data_ready = false;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (i2c_bus_read_byte(imu_device_, kStatusRegister, &status) == ESP_OK &&
+            (status & kAccelDataReady) != 0 && ReadAccelRaw(sample)) {
+            data_ready = true;
+            break;
+        }
+    }
+    if (!data_ready) {
+        ESP_LOGW(TAG, "BMI260 accelerometer data timeout (status=0x%02X)", status);
+        i2c_bus_device_delete(&imu_device_);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "BMI260 accelerometer enabled: x=%d y=%d z=%d", sample.x, sample.y, sample.z);
     return ESP_OK;
 }
 
-bool ReadAccelRaw(struct bmi2_sens_data& accel)
+bool ReadAccelRaw(AccelRaw& accel)
 {
-    if (!bmi_handle_) {
+    if (imu_device_ == nullptr) {
         return false;
     }
-    int8_t rslt = bmi2_get_sensor_data(&accel, bmi_handle_);
-    return rslt == BMI2_OK;
+
+    uint8_t data[6] = {};
+    if (i2c_bus_read_bytes(imu_device_, kAccelDataRegister, sizeof(data), data) != ESP_OK) {
+        return false;
+    }
+    accel.x = static_cast<int16_t>((static_cast<uint16_t>(data[1]) << 8) | data[0]);
+    accel.y = static_cast<int16_t>((static_cast<uint16_t>(data[3]) << 8) | data[2]);
+    accel.z = static_cast<int16_t>((static_cast<uint16_t>(data[5]) << 8) | data[4]);
+    return true;
 }
-} // namespace Bmi270Motion
+} // namespace Bmi260Motion
 
 
 temperature_sensor_handle_t temp_sensor = NULL;
@@ -537,7 +737,7 @@ private:
     TaskHandle_t imu_task_handle_ = nullptr;
     TaskHandle_t touch_slider_task_handle_ = nullptr;
     esp_timer_handle_t emotion_reset_timer_ = nullptr;
-    bool bmi270_ready_ = false;
+    bool imu_ready_ = false;
     bool was_charging_ = false;
     uint8_t low_battery_alert_mask_ = 0;
     int low_battery_plays_left_ = 0;
@@ -693,29 +893,30 @@ private:
     static void imu_event_task(void* arg)
     {
         auto* self = static_cast<EspVocat*>(arg);
-        if (self == nullptr || !self->bmi270_ready_) {
+        if (self == nullptr || !self->imu_ready_) {
             vTaskDelete(NULL);
             return;
         }
 
-        struct bmi2_sens_data prev = {};
-        struct bmi2_sens_data cur = {};
+        Bmi260Motion::AccelRaw prev = {};
+        Bmi260Motion::AccelRaw cur = {};
         bool has_prev = false;
         int64_t last_shake_ms = 0;
-        constexpr int kShakeDeltaThreshold = 20000;
+        constexpr int kShakeDeltaThreshold = 12000;
         constexpr int64_t kShakeCooldownMs = 2000;
 
         while (true) {
-            if (Bmi270Motion::ReadAccelRaw(cur)) {
+            if (Bmi260Motion::ReadAccelRaw(cur)) {
                 if (has_prev) {
-                    int dx = abs(static_cast<int>(cur.acc.x) - static_cast<int>(prev.acc.x));
-                    int dy = abs(static_cast<int>(cur.acc.y) - static_cast<int>(prev.acc.y));
-                    int dz = abs(static_cast<int>(cur.acc.z) - static_cast<int>(prev.acc.z));
+                    int dx = abs(static_cast<int>(cur.x) - static_cast<int>(prev.x));
+                    int dy = abs(static_cast<int>(cur.y) - static_cast<int>(prev.y));
+                    int dz = abs(static_cast<int>(cur.z) - static_cast<int>(prev.z));
                     int shake_score = dx + dy + dz;
 
                     int64_t now_ms = esp_timer_get_time() / 1000;
                     if (shake_score > kShakeDeltaThreshold && (now_ms - last_shake_ms) > kShakeCooldownMs) {
                         last_shake_ms = now_ms;
+                        ESP_LOGI(TAG, "BMI260 shake detected (score=%d)", shake_score);
                         // "dizzy/nauseated" are not guaranteed in current assets, use supported fallback.
                         self->ShowTemporaryEmotion("confused", 1800);
                     }
@@ -885,14 +1086,14 @@ private:
         gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_);
     }
 
-    void InitializeBmi270()
+    void InitializeBmi260()
     {
-        esp_err_t imu_ret = Bmi270Motion::Initialize(shared_i2c_bus_handle_);
+        esp_err_t imu_ret = Bmi260Motion::Initialize(shared_i2c_bus_handle_);
         if (imu_ret == ESP_OK) {
-            bmi270_ready_ = true;
+            imu_ready_ = true;
             xTaskCreatePinnedToCore(imu_event_task, "imu_task", 4 * 1024, this, 4, &imu_task_handle_, 1);
         } else {
-            ESP_LOGW(TAG, "BMI270 unavailable, shake emotion disabled");
+            ESP_LOGW(TAG, "BMI260 unavailable, shake emotion disabled");
         }
     }
 
@@ -1220,7 +1421,7 @@ public:
         uint8_t pcb_version = DetectPcbVersion();
         InitializeCharge();
         InitializeCst816sTouchPad();
-        InitializeBmi270();
+        InitializeBmi260();
 
         InitializeSpi();
         InitializeSt77916Display(pcb_version);
