@@ -914,7 +914,7 @@ private:
         const bool is_swipe = self->slider_swipe_detected_ ||
                               data >= kSwipeDistanceThreshold || data <= -kSwipeDistanceThreshold;
         self->slider_swipe_detected_ = false;
-        self->ShowTouchFeedback(is_swipe ? "surprised" : "happy");
+        self->ShowTouchFeedback(is_swipe ? "shocked" : "happy");
     }
 
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
