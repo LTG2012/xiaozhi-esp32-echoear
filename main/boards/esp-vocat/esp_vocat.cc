@@ -1012,7 +1012,7 @@ private:
             static float btn_thr[2];
             btn_ch[0] = ch1;
             btn_ch[1] = ch2;
-            btn_thr[0] = 0.003f;
+            btn_thr[0] = 0.006f;
             btn_thr[1] = 0.006f;
 
             touch_button_config_t btn_cfg = {
