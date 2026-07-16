@@ -6,7 +6,9 @@
              "sdkconfig_append": [
                  "CONFIG_USE_EMOTE_MESSAGE_STYLE=y",
                  "CONFIG_MMAP_FILE_NAME_LENGTH=32",
-                 "CONFIG_FLASH_EXPRESSION_ASSETS=y"
+                 "CONFIG_FLASH_EXPRESSION_ASSETS=y",
+                 "CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y",
+                 "CONFIG_SR_WN_WN9_NIHAOMIAOBAN_TTS2=y"
              ]
         }
     ]

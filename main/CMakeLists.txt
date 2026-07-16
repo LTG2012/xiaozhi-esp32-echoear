@@ -1122,18 +1122,35 @@ if(CONFIG_BOARD_TYPE_ESP_VOCAT)
         )
         file(MAKE_DIRECTORY "${ESP_VOCAT_ASSETS_STAGING}/360_360")
         file(MAKE_DIRECTORY "${ESP_VOCAT_ASSETS_STAGING}/emoji_large")
+        file(MAKE_DIRECTORY "${ESP_VOCAT_ASSETS_STAGING}/wakenet")
+        file(MAKE_DIRECTORY "${ESP_VOCAT_ASSETS_STAGING}/wakenet_models")
         file(COPY "${EMOTE_ASSETS_PATH}/emoji_large/" DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/emoji_large")
         file(COPY "${EMOTE_ASSETS_PATH}/360_360/layout.json" DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/360_360")
+        file(COPY "${EMOTE_ASSETS_PATH}/360_360/config.json" DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/360_360")
         file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/assets/360_360/emote.json"
              DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/360_360")
         file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/emoji/low_battery.eaf"
              DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/emoji_large")
         file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/emoji/battery_connected.eaf"
              DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/emoji_large")
+        file(COPY "${ESP_SR_COMPONENT_PATH}/model/wakenet_model/wn9_nihaoxiaozhi_tts"
+             "${ESP_SR_COMPONENT_PATH}/model/wakenet_model/wn9_nihaomiaoban_tts2"
+             DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/wakenet_models")
+        execute_process(
+            COMMAND python "${ESP_SR_COMPONENT_PATH}/model/pack_model.py"
+                    --model_path "${ESP_VOCAT_ASSETS_STAGING}/wakenet_models"
+                    --out_file "${ESP_VOCAT_ASSETS_STAGING}/wakenet/srmodels.bin"
+            RESULT_VARIABLE ESP_VOCAT_WAKE_WORD_PACK_RESULT
+        )
+        if(NOT ESP_VOCAT_WAKE_WORD_PACK_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to pack ESP-VoCat wake-word models")
+        endif()
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/assets/360_360/emote.json"
             "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/emoji/low_battery.eaf"
             "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/emoji/battery_connected.eaf"
+            "${ESP_SR_COMPONENT_PATH}/model/wakenet_model/wn9_nihaoxiaozhi_tts/_MODEL_INFO_"
+            "${ESP_SR_COMPONENT_PATH}/model/wakenet_model/wn9_nihaomiaoban_tts2/_MODEL_INFO_"
         )
     else()
         message(WARNING "esp_emote_assets component not found; ESP-VoCat custom emotes will be skipped")
