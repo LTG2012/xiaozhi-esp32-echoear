@@ -27,7 +27,6 @@
 
 extern "C" {
 #include "touch_button_sensor.h"
-#include "touch_slider_sensor.h"
 }
 
 #include "driver/temperature_sensor.h"
@@ -543,9 +542,16 @@ private:
     uint8_t low_battery_alert_mask_ = 0;
     int low_battery_plays_left_ = 0;
     int64_t next_low_battery_play_ms_ = 0;
-    touch_slider_handle_t touch_slider_handle_ = nullptr;
     touch_button_handle_t touch_button_handle_ = nullptr;
-    bool slider_swipe_detected_ = false;
+    bool two_pad_touch_mode_ = false;
+    uint32_t touch_pad1_channel_ = 0;
+    uint32_t touch_pad2_channel_ = 0;
+    uint8_t touch_active_mask_ = 0;
+    uint32_t touch_start_channel_ = 0;
+    int64_t touch_start_time_us_ = 0;
+    bool touch_release_pending_ = false;
+    int64_t touch_release_time_us_ = 0;
+    bool touch_swipe_detected_ = false;
 
     static void emotion_reset_timer_callback(void* arg)
     {
@@ -576,6 +582,15 @@ private:
             return;
         }
         s_last_us = now;
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display_);
+        if (emote_display != nullptr && emote_display->InsertAnimDialog(emotion, 2000)) {
+            if (emotion_reset_timer_ != nullptr) {
+                esp_timer_stop(emotion_reset_timer_);
+            }
+            return;
+        }
+#endif
         ShowTemporaryEmotion(emotion, 2000);
     }
 
@@ -892,31 +907,6 @@ private:
         return 0;
     }
 
-    static void touch_slider_event_callback(touch_slider_handle_t handle, touch_slider_event_t event, int32_t data, void* cb_arg)
-    {
-        (void)handle;
-        auto* self = static_cast<EspVocat*>(cb_arg);
-        if (self == nullptr || self->display_ == nullptr) {
-            return;
-        }
-        if (event != TOUCH_SLIDER_EVENT_POSITION) {
-            ESP_LOGI(TAG, "Touch slider evt=%d data=%" PRId32, static_cast<int>(event), data);
-        }
-
-        if (event == TOUCH_SLIDER_EVENT_LEFT_SWIPE || event == TOUCH_SLIDER_EVENT_RIGHT_SWIPE) {
-            self->slider_swipe_detected_ = true;
-            return;
-        }
-        if (event != TOUCH_SLIDER_EVENT_RELEASE) {
-            return;
-        }
-        constexpr int32_t kSwipeDistanceThreshold = 1000;
-        const bool is_swipe = self->slider_swipe_detected_ ||
-                              data >= kSwipeDistanceThreshold || data <= -kSwipeDistanceThreshold;
-        self->slider_swipe_detected_ = false;
-        self->ShowTouchFeedback(is_swipe ? "shocked" : "happy");
-    }
-
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
     {
         (void)handle;
@@ -924,9 +914,65 @@ private:
         if (self == nullptr || self->display_ == nullptr) {
             return;
         }
+        if (!self->two_pad_touch_mode_) {
+            if (state == TOUCH_STATE_ACTIVE) {
+                ESP_LOGI(TAG, "Touch button ACTIVE ch=%" PRIu32, channel);
+                self->ShowTouchFeedback("happy");
+            }
+            return;
+        }
+
+        const uint8_t channel_mask = channel == self->touch_pad1_channel_ ? BIT0 :
+                                     channel == self->touch_pad2_channel_ ? BIT1 : 0;
+        if (channel_mask == 0) {
+            return;
+        }
+        const int64_t now_us = esp_timer_get_time();
         if (state == TOUCH_STATE_ACTIVE) {
-            ESP_LOGI(TAG, "Touch button ACTIVE ch=%" PRIu32, channel);
-            self->ShowTouchFeedback("happy");
+            if (self->touch_release_pending_) {
+                constexpr int64_t kTransitionWindowUs = 450 * 1000;
+                if (now_us - self->touch_release_time_us_ <= kTransitionWindowUs &&
+                    channel != self->touch_start_channel_) {
+                    self->touch_swipe_detected_ = true;
+                    self->touch_release_pending_ = false;
+                    ESP_LOGI(TAG, "Touch pads switched ch%" PRIu32 " -> ch%" PRIu32,
+                             self->touch_start_channel_, channel);
+                } else {
+                    self->ShowTouchFeedback(self->touch_swipe_detected_ ? "shocked" : "happy");
+                    self->touch_swipe_detected_ = false;
+                    self->touch_release_pending_ = false;
+                    self->touch_start_channel_ = channel;
+                    self->touch_start_time_us_ = now_us;
+                }
+            } else if (self->touch_active_mask_ == 0) {
+                self->touch_start_channel_ = channel;
+                self->touch_start_time_us_ = now_us;
+                self->touch_swipe_detected_ = false;
+                ESP_LOGI(TAG, "Touch pads start ch=%" PRIu32, channel);
+            } else if (channel != self->touch_start_channel_ && now_us - self->touch_start_time_us_ >= 80 * 1000) {
+                self->touch_swipe_detected_ = true;
+                ESP_LOGI(TAG, "Touch pads overlapped ch%" PRIu32 " -> ch%" PRIu32,
+                         self->touch_start_channel_, channel);
+            }
+            self->touch_active_mask_ |= channel_mask;
+        } else {
+            self->touch_active_mask_ &= ~channel_mask;
+            if (self->touch_active_mask_ == 0) {
+                self->touch_release_pending_ = true;
+                self->touch_release_time_us_ = now_us;
+            }
+        }
+    }
+
+    void HandleTouchRelease()
+    {
+        constexpr int64_t kTransitionWindowUs = 450 * 1000;
+        if (two_pad_touch_mode_ && touch_release_pending_ &&
+            esp_timer_get_time() - touch_release_time_us_ > kTransitionWindowUs) {
+            ShowTouchFeedback(touch_swipe_detected_ ? "shocked" : "happy");
+            touch_swipe_detected_ = false;
+            touch_release_pending_ = false;
+            touch_start_channel_ = 0;
         }
     }
 
@@ -934,12 +980,9 @@ private:
     {
         auto* self = static_cast<EspVocat*>(arg);
         while (true) {
-            if (self != nullptr) {
-                if (self->touch_slider_handle_ != nullptr) {
-                    touch_slider_sensor_handle_events(self->touch_slider_handle_);
-                } else if (self->touch_button_handle_ != nullptr) {
-                    touch_button_sensor_handle_events(self->touch_button_handle_);
-                }
+            if (self != nullptr && self->touch_button_handle_ != nullptr) {
+                touch_button_sensor_handle_events(self->touch_button_handle_);
+                self->HandleTouchRelease();
             }
             vTaskDelay(pdMS_TO_TICKS(20));
         }
@@ -965,36 +1008,33 @@ private:
                 return;
             }
 
-            static uint32_t slider_ch[2];
-            static float slider_thr[2];
-            slider_ch[0] = ch1;
-            slider_ch[1] = ch2;
-            slider_thr[0] = 0.004f;
-            slider_thr[1] = 0.006f;
+            static uint32_t btn_ch[2];
+            static float btn_thr[2];
+            btn_ch[0] = ch1;
+            btn_ch[1] = ch2;
+            btn_thr[0] = 0.003f;
+            btn_thr[1] = 0.006f;
 
-            touch_slider_config_t sld_cfg = {
+            touch_button_config_t btn_cfg = {
                 .channel_num = 2,
-                .channel_list = slider_ch,
-                .channel_threshold = slider_thr,
+                .channel_list = btn_ch,
+                .channel_threshold = btn_thr,
                 .channel_gold_value = nullptr,
                 .debounce_times = 1,
-                .filter_reset_times = 5,
-                .position_range = 10000,
-                .calculate_window = 2,
-                .swipe_threshold = 28.f,
-                .swipe_hysterisis = 22.f,
-                .swipe_alpha = 0.9f,
                 .skip_lowlevel_init = false,
             };
-            esp_err_t err = touch_slider_sensor_create(&sld_cfg, &touch_slider_handle_, touch_slider_event_callback, this);
+            esp_err_t err = touch_button_sensor_create(&btn_cfg, &touch_button_handle_, touch_button_event_callback, this);
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "touch_slider_sensor_create failed: %s", esp_err_to_name(err));
-                touch_slider_handle_ = nullptr;
+                ESP_LOGW(TAG, "touch_button_sensor_create failed: %s", esp_err_to_name(err));
+                touch_button_handle_ = nullptr;
                 return;
             }
+            two_pad_touch_mode_ = true;
+            touch_pad1_channel_ = ch1;
+            touch_pad2_channel_ = ch2;
             xTaskCreatePinnedToCore(touch_cap_poll_task, "touch_cap", 3072, this, 3, &touch_slider_task_handle_, 1);
-            ESP_LOGI(TAG, "Touch slider (PCB v1.2+): PAD1 GPIO%d ch%u, PAD2 GPIO%d ch%u",
-                     (int)TOUCH_PAD1, (unsigned)slider_ch[0], (int)TOUCH_PAD2, (unsigned)slider_ch[1]);
+            ESP_LOGI(TAG, "Touch pads (PCB v1.2+): PAD1 GPIO%d ch%u, PAD2 GPIO%d ch%u",
+                     (int)TOUCH_PAD1, (unsigned)btn_ch[0], (int)TOUCH_PAD2, (unsigned)btn_ch[1]);
             return;
         }
 
@@ -1135,10 +1175,6 @@ public:
         if (touch_slider_task_handle_ != nullptr) {
             vTaskDelete(touch_slider_task_handle_);
             touch_slider_task_handle_ = nullptr;
-        }
-        if (touch_slider_handle_ != nullptr) {
-            touch_slider_sensor_delete(touch_slider_handle_);
-            touch_slider_handle_ = nullptr;
         }
         if (touch_button_handle_ != nullptr) {
             touch_button_sensor_delete(touch_button_handle_);
