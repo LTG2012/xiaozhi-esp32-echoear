@@ -1,6 +1,7 @@
 #include "afe_audio_engine.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -92,13 +93,20 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms, srmode
         }
     } else if (wakenet_model_name != nullptr) {
         wake_detector_ = WakeDetector::kWakeNet;
-        auto words = esp_srmodel_get_wake_words(models_, wakenet_model_name);
-        if (words != nullptr) {
+        for (int i = 0; i < models_->num; ++i) {
+            if (std::strstr(models_->model_name[i], ESP_WN_PREFIX) == nullptr) {
+                continue;
+            }
+            auto words = esp_srmodel_get_wake_words(models_, models_->model_name[i]);
+            if (words == nullptr) {
+                continue;
+            }
             std::stringstream stream(words);
             std::string word;
             while (std::getline(stream, word, ';')) {
                 wake_words_.push_back(word);
             }
+            free(words);
         }
 #if CONFIG_SEND_WAKE_WORD_DATA
         if (!wake_word_audio_cache_.Initialize(16000 * 2)) {
