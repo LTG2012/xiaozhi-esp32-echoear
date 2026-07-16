@@ -566,7 +566,7 @@ private:
         }
     }
 
-    void ShowHappyTouchFeedback()
+    void ShowTouchFeedback(const char* emotion)
     {
         static int64_t s_last_us = 0;
         constexpr int64_t kCooldownUs = 1200000;
@@ -575,7 +575,7 @@ private:
             return;
         }
         s_last_us = now;
-        ShowTemporaryEmotion("happy", 2000);
+        ShowTemporaryEmotion(emotion, 2000);
     }
 
     void PlayBatteryEmotion(const char* emotion, uint32_t duration_ms)
@@ -902,18 +902,12 @@ private:
             ESP_LOGI(TAG, "Touch slider evt=%d data=%" PRId32, static_cast<int>(event), data);
         }
 
-        bool gesture = false;
-        if (event == TOUCH_SLIDER_EVENT_LEFT_SWIPE || event == TOUCH_SLIDER_EVENT_RIGHT_SWIPE) {
-            gesture = true;
-        } else if (event == TOUCH_SLIDER_EVENT_RELEASE) {
-            gesture = true;
-        }
-
-        if (!gesture) {
+        if (event != TOUCH_SLIDER_EVENT_RELEASE) {
             return;
         }
-
-        self->ShowHappyTouchFeedback();
+        constexpr int32_t kSwipeDistanceThreshold = 1000;
+        const bool is_swipe = data >= kSwipeDistanceThreshold || data <= -kSwipeDistanceThreshold;
+        self->ShowTouchFeedback(is_swipe ? "surprised" : "happy");
     }
 
     static void touch_button_event_callback(touch_button_handle_t handle, uint32_t channel, touch_state_t state, void* cb_arg)
@@ -925,7 +919,7 @@ private:
         }
         if (state == TOUCH_STATE_ACTIVE) {
             ESP_LOGI(TAG, "Touch button ACTIVE ch=%" PRIu32, channel);
-            self->ShowHappyTouchFeedback();
+            self->ShowTouchFeedback("happy");
         }
     }
 
