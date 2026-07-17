@@ -820,10 +820,12 @@ void Application::HandleWakeWordDetectedEvent() {
 
     if (state == kDeviceStateIdle) {
         audio_service_.EncodeWakeWord();
-        auto wake_word = audio_service_.GetLastWakeWord();
+        if (!SetDeviceState(kDeviceStateConnecting)) {
+            audio_service_.EnableWakeWordDetection(true);
+            return;
+        }
 
         if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update),
             // then continue with OpenAudioChannel which may block for ~1 second
             Schedule([this, wake_word]() {
@@ -867,7 +869,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
-            audio_service_.EnableWakeWordDetection(true);
+            SetDeviceState(kDeviceStateIdle);
             return;
         }
     }
@@ -1063,9 +1065,12 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     
     if (state == kDeviceStateIdle) {
         audio_service_.EncodeWakeWord();
+        if (!SetDeviceState(kDeviceStateConnecting)) {
+            audio_service_.EnableWakeWordDetection(true);
+            return;
+        }
 
         if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
             // Schedule to let the state change be processed first (UI update)
             Schedule([this, wake_word]() {
                 ContinueWakeWordInvoke(wake_word);

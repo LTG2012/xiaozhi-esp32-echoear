@@ -223,10 +223,15 @@ size_t CustomWakeWord::GetFeedSize() {
 }
 
 void CustomWakeWord::EncodeWakeWordData() {
-    const size_t stack_size = 4096 * 7;
-    wake_word_opus_.clear();
+    constexpr size_t stack_size_bytes = 4096 * 7;
+    constexpr uint32_t stack_depth = stack_size_bytes / sizeof(StackType_t);
+    {
+        std::lock_guard<std::mutex> lock(wake_word_mutex_);
+        wake_word_opus_.clear();
+    }
     if (wake_word_encode_task_stack_ == nullptr) {
-        wake_word_encode_task_stack_ = (StackType_t*)heap_caps_malloc(stack_size, MALLOC_CAP_SPIRAM);
+        wake_word_encode_task_stack_ =
+            (StackType_t*)heap_caps_malloc(stack_size_bytes, MALLOC_CAP_SPIRAM);
         assert(wake_word_encode_task_stack_ != nullptr);
     }
     if (wake_word_encode_task_buffer_ == nullptr) {
@@ -234,9 +239,11 @@ void CustomWakeWord::EncodeWakeWordData() {
         assert(wake_word_encode_task_buffer_ != nullptr);
     }
 
-    wake_word_encode_task_ = xTaskCreateStatic([](void* arg) {
-        auto this_ = (CustomWakeWord*)arg;
-        {
+    if (wake_word_encode_task_ == nullptr) {
+        wake_word_encode_task_ = xTaskCreateStatic([](void* arg) {
+            auto this_ = (CustomWakeWord*)arg;
+            while (true) {
+                ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             auto start_time = esp_timer_get_time();
             // Create encoder
             esp_opus_enc_config_t opus_enc_cfg = AS_OPUS_ENC_CONFIG();
@@ -248,8 +255,7 @@ void CustomWakeWord::EncodeWakeWordData() {
                 std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
                 this_->wake_word_opus_.push_back(std::vector<uint8_t>());
                 this_->wake_word_cv_.notify_all();
-                vTaskDelete(nullptr);
-                return;
+                continue;
             }
             // Get frame size
             int frame_size = 0;
@@ -294,9 +300,12 @@ void CustomWakeWord::EncodeWakeWordData() {
             std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
             this_->wake_word_opus_.push_back(std::vector<uint8_t>());
             this_->wake_word_cv_.notify_all();
-        }
-        vTaskDelete(NULL);
-    }, "encode_wake_word", stack_size, this, 2, wake_word_encode_task_stack_, wake_word_encode_task_buffer_);
+            }
+        }, "encode_wake_word", stack_depth, this, 2,
+           wake_word_encode_task_stack_, wake_word_encode_task_buffer_);
+        assert(wake_word_encode_task_ != nullptr);
+    }
+    xTaskNotifyGive(wake_word_encode_task_);
 }
 
 bool CustomWakeWord::GetWakeWordOpus(std::vector<uint8_t>& opus) {

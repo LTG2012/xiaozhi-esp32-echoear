@@ -201,7 +201,7 @@ SdMusicPlayer::SdMusicPlayer() {
     }
 
     const BaseType_t created = xTaskCreatePinnedToCore(
-        WorkerTaskEntry, "sd_music", 12 * 1024, this, 3, &worker_task_, 1);
+        WorkerTaskEntry, "sd_music", 12 * 1024, this, 2, &worker_task_, 1);
     if (created != pdPASS) {
         worker_task_ = nullptr;
         ESP_LOGE(kTag, "Failed to create music worker task");
