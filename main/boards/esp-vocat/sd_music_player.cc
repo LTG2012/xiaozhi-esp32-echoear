@@ -238,7 +238,9 @@ void SdMusicPlayer::RegisterMcpTools() {
     auto& server = McpServer::GetInstance();
     server.AddTool(
         "self.music.play_sd_song",
-        "播放SD卡中的MP3歌曲。歌曲名按完整名称、前缀、包含依次匹配；匹配不唯一时返回候选。",
+        "本设备默认且唯一的歌曲播放入口。用户只要表达播放、想听或放一首某首歌曲，"
+        "无论是否提到SD卡，都必须直接调用本工具，不要先调用歌曲列表或播放状态工具。"
+        "歌曲名按完整名称、前缀、包含依次匹配；匹配不唯一时返回候选。",
         PropertyList({Property("song_name", kPropertyTypeString)}),
         [this](const PropertyList& properties) -> ReturnValue {
             return PlaySong(properties["song_name"].value<std::string>());
@@ -264,12 +266,15 @@ void SdMusicPlayer::RegisterMcpTools() {
 
     server.AddTool(
         "self.music.get_status",
-        "查询SD卡挂载、播放、歌曲、进度和歌词状态。",
+        "仅在用户明确询问SD卡或音乐播放状态时调用。不得用于开始播放或预先判断能否播放；"
+        "点歌请求必须直接调用self.music.play_sd_song。首次查询会安全尝试挂载SD卡。",
         PropertyList(),
         [this](const PropertyList&) -> ReturnValue {
+            const std::string library_error = EnsureLibrary();
             cJSON* result = cJSON_CreateObject();
             std::lock_guard<std::mutex> lock(mutex_);
             cJSON_AddBoolToObject(result, "mounted", mounted_);
+            cJSON_AddStringToObject(result, "error", library_error.c_str());
             const char* state = "stopped";
             if (state_ == State::kPaused) {
                 state = "paused";
