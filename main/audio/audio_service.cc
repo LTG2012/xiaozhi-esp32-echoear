@@ -224,6 +224,48 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     return true;
 }
 
+bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm,
+                                          AudioPlaybackSource source, bool wait) {
+    if (pcm.empty()) {
+        return true;
+    }
+
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    if (wait) {
+        audio_queue_cv_.wait(lock, [this]() {
+            return service_stopped_ || audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
+        });
+    }
+    if (service_stopped_ || audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE) {
+        return false;
+    }
+
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->pcm = std::move(pcm);
+    task->timestamp = 0;
+    task->source = source;
+    audio_playback_queue_.push_back(std::move(task));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+size_t AudioService::ClearPlaybackQueue(AudioPlaybackSource source) {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    size_t cleared_samples = 0;
+    auto it = audio_playback_queue_.begin();
+    while (it != audio_playback_queue_.end()) {
+        if ((*it)->source == source) {
+            cleared_samples += (*it)->pcm.size();
+            it = audio_playback_queue_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    audio_queue_cv_.notify_all();
+    return cleared_samples;
+}
+
 void AudioService::AudioInputTask() {
     while (true) {
         EventBits_t bits = xEventGroupWaitBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |

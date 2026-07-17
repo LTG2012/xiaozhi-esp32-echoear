@@ -7,12 +7,14 @@
 #include "config.h"
 #include "backlight.h"
 #include "esp_video.h"
+#include "sd_music_player.h"
 
 #include <esp_log.h>
 #include <esp_err.h>
 #include <esp_timer.h>
 #include "esp_idf_version.h"
 #include <cinttypes>
+#include <memory>
 
 #include <driver/i2c_master.h>
 #include <cstdlib>
@@ -552,6 +554,7 @@ private:
     bool touch_release_pending_ = false;
     int64_t touch_release_time_us_ = 0;
     bool touch_swipe_detected_ = false;
+    std::unique_ptr<SdMusicPlayer> music_player_;
 
     static void emotion_reset_timer_callback(void* arg)
     {
@@ -1012,15 +1015,15 @@ private:
             static float btn_thr[2];
             btn_ch[0] = ch1;
             btn_ch[1] = ch2;
-            btn_thr[0] = 0.006f;
-            btn_thr[1] = 0.006f;
+            btn_thr[0] = 0.012f;
+            btn_thr[1] = 0.012f;
 
             touch_button_config_t btn_cfg = {
                 .channel_num = 2,
                 .channel_list = btn_ch,
                 .channel_threshold = btn_thr,
                 .channel_gold_value = nullptr,
-                .debounce_times = 1,
+                .debounce_times = 3,
                 .skip_lowlevel_init = false,
             };
             esp_err_t err = touch_button_sensor_create(&btn_cfg, &touch_button_handle_, touch_button_event_callback, this);
@@ -1162,6 +1165,9 @@ private:
 
 public:
     ~EspVocat() {
+        // Music owns a worker that may update the display, so stop it before deleting display objects.
+        music_player_.reset();
+
         // Stop tasks
         if (charge_task_handle_ != nullptr) {
             vTaskDelete(charge_task_handle_);
@@ -1226,6 +1232,8 @@ public:
         InitializeSt77916Display(pcb_version);
         InitializeButtons();
         InitializeCapacitiveTouchPads();
+        music_player_ = std::make_unique<SdMusicPlayer>();
+        music_player_->RegisterMcpTools();
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
         InitializeCamera();
 #endif // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE

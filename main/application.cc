@@ -19,6 +19,14 @@
 
 #define TAG "Application"
 
+namespace {
+
+bool IsEndConversationCommand(const char* text) {
+    return text != nullptr && std::string(text).rfind("结束对话", 0) == 0;
+}
+
+} // namespace
+
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -525,6 +533,9 @@ void Application::InitializeProtocol() {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
+                    if (conversation_end_requested_.load()) {
+                        return;
+                    }
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
@@ -542,7 +553,10 @@ void Application::InitializeProtocol() {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring)]() {
+                    Schedule([this, display, message = std::string(text->valuestring)]() {
+                        if (conversation_end_requested_.load()) {
+                            return;
+                        }
                         display->SetChatMessage("assistant", message.c_str());
                     });
                 }
@@ -551,6 +565,10 @@ void Application::InitializeProtocol() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
+                if (IsEndConversationCommand(text->valuestring)) {
+                    EndConversation();
+                    return;
+                }
                 Schedule([display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -669,6 +687,20 @@ void Application::StartListening() {
 
 void Application::StopListening() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING);
+}
+
+void Application::EndConversation() {
+    conversation_end_requested_.store(true);
+    Schedule([this]() {
+        const auto state = GetDeviceState();
+        if (state == kDeviceStateListening && protocol_) {
+            protocol_->SendStopListening();
+        } else if (state == kDeviceStateSpeaking) {
+            AbortSpeaking(kAbortReasonNone);
+        }
+        audio_service_.EnableVoiceProcessing(false);
+        SetDeviceState(kDeviceStateIdle);
+    });
 }
 
 void Application::HandleToggleChatEvent() {
@@ -948,6 +980,7 @@ void Application::AbortSpeaking(AbortReason reason) {
 }
 
 void Application::SetListeningMode(ListeningMode mode) {
+    conversation_end_requested_.store(false);
     listening_mode_ = mode;
     SetDeviceState(kDeviceStateListening);
 }

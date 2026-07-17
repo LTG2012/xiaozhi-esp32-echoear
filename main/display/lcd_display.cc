@@ -1071,6 +1071,59 @@ void LcdDisplay::ClearChatMessages() {
 }
 #endif
 
+void LcdDisplay::SetMusicLyrics(const char* title, const char* lyrics) {
+    if (!setup_ui_called_) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    if (music_overlay_ == nullptr) {
+        auto* screen = lv_screen_active();
+        auto* theme = static_cast<LvglTheme*>(current_theme_);
+        auto* text_font = theme->text_font()->font();
+
+        music_overlay_ = lv_obj_create(screen);
+        lv_obj_remove_flag(music_overlay_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(music_overlay_, LV_PCT(100), LV_PCT(100));
+        lv_obj_center(music_overlay_);
+        lv_obj_set_style_radius(music_overlay_, 0, 0);
+        lv_obj_set_style_border_width(music_overlay_, 0, 0);
+        lv_obj_set_style_pad_all(music_overlay_, 0, 0);
+        lv_obj_set_style_bg_color(music_overlay_, lv_color_hex(0x080A12), 0);
+        lv_obj_set_style_bg_opa(music_overlay_, LV_OPA_COVER, 0);
+
+        music_title_ = lv_label_create(music_overlay_);
+        lv_obj_set_width(music_title_, LV_PCT(88));
+        lv_obj_align(music_title_, LV_ALIGN_TOP_MID, 0, 54);
+        lv_label_set_long_mode(music_title_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_style_text_align(music_title_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(music_title_, text_font, 0);
+        lv_obj_set_style_text_color(music_title_, lv_color_hex(0x62D9FF), 0);
+
+        music_lyrics_ = lv_label_create(music_overlay_);
+        lv_obj_set_size(music_lyrics_, LV_PCT(92), std::max(1, height_ - 120));
+        lv_obj_align(music_lyrics_, LV_ALIGN_TOP_MID, 0, 110);
+        lv_label_set_long_mode(music_lyrics_, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(music_lyrics_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(music_lyrics_, text_font, 0);
+        lv_obj_set_style_text_color(music_lyrics_, lv_color_white(), 0);
+        lv_obj_set_style_text_line_space(music_lyrics_, 8, 0);
+    }
+
+    lv_label_set_text(music_title_, title ? title : "");
+    lv_label_set_text(music_lyrics_, lyrics ? lyrics : "");
+    lv_obj_remove_flag(music_overlay_, LV_OBJ_FLAG_HIDDEN);
+    if (top_bar_ != nullptr) {
+        lv_obj_move_foreground(top_bar_);
+    }
+}
+
+void LcdDisplay::ClearMusicLyrics() {
+    DisplayLockGuard lock(this);
+    if (music_overlay_ != nullptr) {
+        lv_obj_add_flag(music_overlay_, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 void LcdDisplay::SetEmotion(const char* emotion) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!", emotion);

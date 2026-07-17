@@ -7,6 +7,7 @@
 #include <esp_timer.h>
 
 #include <string>
+#include <atomic>
 #include <mutex>
 #include <deque>
 #include <memory>
@@ -104,6 +105,9 @@ public:
      */
     void StopListening();
 
+    // End the active voice turn and ignore any late response from that turn.
+    void EndConversation();
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
@@ -142,6 +146,7 @@ private:
 
     bool has_server_time_ = false;
     bool aborted_ = false;
+    std::atomic<bool> conversation_end_requested_{false};
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;

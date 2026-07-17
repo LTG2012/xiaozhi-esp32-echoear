@@ -4,6 +4,9 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <array>
+#include <string>
+#include <vector>
 #include <unordered_map>
 #include <tuple>
 #include <algorithm>
@@ -30,6 +33,9 @@
 #include "gfx.h"
 #include "expression_emote.h"
 
+extern "C" {
+LV_FONT_DECLARE(font_puhui_basic_20_4);
+}
 
 namespace emote {
 
@@ -38,6 +44,250 @@ namespace emote {
 // ============================================================================
 
 static const char* TAG = "EmoteDisplay";
+static constexpr int kMusicStatusBarHeight = 70;
+static constexpr size_t kMusicLyricRowCount = 7;
+static constexpr int kMusicLyricRowHeight = 28;
+static constexpr std::array<int, kMusicLyricRowCount> kMusicLyricRowY = {
+    110, 140, 170, 200, 230, 260, 290,
+};
+static constexpr std::array<int, kMusicLyricRowCount> kMusicLyricRowWidth = {
+    324, 340, 344, 340, 324, 292, 244,
+};
+
+struct MusicLyricSourceLine {
+    std::string text;
+    bool current = false;
+};
+
+struct MusicLyricVisualLine {
+    std::string text;
+    bool current = false;
+    int estimated_width = 0;
+};
+
+static uint32_t DecodeUtf8Codepoint(const std::string& text, size_t& position, size_t& byte_count)
+{
+    const auto first = static_cast<uint8_t>(text[position]);
+    byte_count = 1;
+    if (first < 0x80) {
+        ++position;
+        return first;
+    }
+
+    if ((first & 0xE0) == 0xC0 && position + 1 < text.size()) {
+        byte_count = 2;
+        const uint32_t value = ((first & 0x1F) << 6) |
+                               (static_cast<uint8_t>(text[position + 1]) & 0x3F);
+        position += 2;
+        return value;
+    }
+    if ((first & 0xF0) == 0xE0 && position + 2 < text.size()) {
+        byte_count = 3;
+        const uint32_t value = ((first & 0x0F) << 12) |
+                               ((static_cast<uint8_t>(text[position + 1]) & 0x3F) << 6) |
+                               (static_cast<uint8_t>(text[position + 2]) & 0x3F);
+        position += 3;
+        return value;
+    }
+    if ((first & 0xF8) == 0xF0 && position + 3 < text.size()) {
+        byte_count = 4;
+        const uint32_t value = ((first & 0x07) << 18) |
+                               ((static_cast<uint8_t>(text[position + 1]) & 0x3F) << 12) |
+                               ((static_cast<uint8_t>(text[position + 2]) & 0x3F) << 6) |
+                               (static_cast<uint8_t>(text[position + 3]) & 0x3F);
+        position += 4;
+        return value;
+    }
+
+    ++position;
+    return first;
+}
+
+static int EstimateMusicGlyphWidth(uint32_t codepoint)
+{
+    if (codepoint == ' ') {
+        return 7;
+    }
+    if (codepoint < 0x80) {
+        if (std::strchr(".,:;!'`|ijlI()[]{}", static_cast<int>(codepoint)) != nullptr) {
+            return 7;
+        }
+        return 11;
+    }
+    return 20;
+}
+
+static std::vector<MusicLyricSourceLine> ParseMusicLyricSource(const char* lyrics)
+{
+    std::vector<MusicLyricSourceLine> result;
+    std::string source = lyrics ? lyrics : "";
+    size_t start = 0;
+    while (start <= source.size()) {
+        const size_t end = source.find('\n', start);
+        std::string line = source.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const bool current = line.rfind("> ", 0) == 0;
+        if (current) {
+            line.erase(0, 2);
+        }
+        if (!line.empty()) {
+            result.push_back({std::move(line), current});
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return result;
+}
+
+static std::vector<MusicLyricVisualLine> LayoutMusicLyrics(
+    const std::vector<MusicLyricSourceLine>& source_lines,
+    const std::array<int, kMusicLyricRowCount>& row_widths,
+    size_t start_source,
+    int* current_first_row,
+    bool* truncated)
+{
+    std::vector<MusicLyricVisualLine> rows;
+    *current_first_row = -1;
+    *truncated = false;
+
+    size_t source_index = start_source;
+    for (; source_index < source_lines.size() && rows.size() < kMusicLyricRowCount;
+         ++source_index) {
+        const auto& source = source_lines[source_index];
+        const size_t first_row_for_source = rows.size();
+        size_t position = 0;
+        bool emitted = false;
+
+        while (position < source.text.size() && rows.size() < kMusicLyricRowCount) {
+            const size_t row_index = rows.size();
+            const int width_limit = row_widths[row_index];
+            std::string row_text;
+            int row_width = 0;
+
+            while (position < source.text.size()) {
+                const size_t character_start = position;
+                size_t byte_count = 0;
+                const uint32_t codepoint = DecodeUtf8Codepoint(source.text, position, byte_count);
+                const int glyph_width = EstimateMusicGlyphWidth(codepoint);
+                if (!row_text.empty() && row_width + glyph_width > width_limit) {
+                    position = character_start;
+                    break;
+                }
+                if (row_text.empty() && codepoint == ' ') {
+                    continue;
+                }
+                row_text.append(source.text, character_start, byte_count);
+                row_width += glyph_width;
+            }
+
+            while (!row_text.empty() && row_text.back() == ' ') {
+                row_text.pop_back();
+                row_width -= 7;
+            }
+            if (source.current && *current_first_row < 0) {
+                *current_first_row = static_cast<int>(rows.size());
+            }
+            rows.push_back({std::move(row_text), source.current, row_width});
+            emitted = true;
+        }
+
+        if (!emitted && rows.size() < kMusicLyricRowCount) {
+            if (source.current && *current_first_row < 0) {
+                *current_first_row = static_cast<int>(rows.size());
+            }
+            rows.push_back({"", source.current, 0});
+        }
+        if (position < source.text.size()) {
+            *truncated = true;
+            if (!source.current) {
+                // Never leave half of a future/previous lyric at the bottom of
+                // the circular viewport. The active lyric keeps priority and
+                // may use every row in the pathological case of a very long line.
+                rows.resize(first_row_for_source);
+            }
+            break;
+        }
+    }
+    if (source_index < source_lines.size()) {
+        *truncated = true;
+    }
+    return rows;
+}
+
+static std::vector<MusicLyricVisualLine> BuildCircularMusicLyricRows(
+    const char* lyrics,
+    const std::array<int, kMusicLyricRowCount>& row_widths,
+    bool* truncated)
+{
+    const auto source_lines = ParseMusicLyricSource(lyrics);
+    if (source_lines.empty()) {
+        *truncated = false;
+        return {};
+    }
+
+    size_t current_source = source_lines.size();
+    for (size_t i = 0; i < source_lines.size(); ++i) {
+        if (source_lines[i].current) {
+            current_source = i;
+            break;
+        }
+    }
+
+    size_t start_source = current_source < source_lines.size() && current_source > 0
+                              ? current_source - 1
+                              : 0;
+    std::vector<MusicLyricVisualLine> rows;
+    int current_first_row = -1;
+    do {
+        rows = LayoutMusicLyrics(source_lines, row_widths, start_source,
+                                 &current_first_row, truncated);
+        if (current_source >= source_lines.size() ||
+            (current_first_row >= 0 && current_first_row <= 2)) {
+            break;
+        }
+        ++start_source;
+    } while (start_source <= current_source);
+
+    if (current_source >= source_lines.size() && rows.size() == 1) {
+        std::vector<MusicLyricVisualLine> centered(2);
+        centered.push_back(std::move(rows.front()));
+        return centered;
+    }
+    return rows;
+}
+
+static gfx_font_t LoadMusicFontFromAssets()
+{
+    void* index_data = nullptr;
+    size_t index_size = 0;
+    auto& assets = Assets::GetInstance();
+    if (!assets.GetAssetData("index.json", index_data, index_size)) {
+        return nullptr;
+    }
+
+    cJSON* root = cJSON_ParseWithLength(static_cast<const char*>(index_data), index_size);
+    if (!root) {
+        return nullptr;
+    }
+    cJSON* font_name_json = cJSON_GetObjectItem(root, "text_font");
+    if (!cJSON_IsString(font_name_json)) {
+        cJSON_Delete(root);
+        return nullptr;
+    }
+    const std::string font_name = font_name_json->valuestring;
+    cJSON_Delete(root);
+
+    void* font_data = nullptr;
+    size_t font_size = 0;
+    if (!assets.GetAssetData(font_name, font_data, font_size) || !font_data || font_size == 0) {
+        return nullptr;
+    }
+    return (gfx_font_t)gfx_font_lv_load_from_binary(static_cast<uint8_t*>(font_data));
+}
 
 // ============================================================================
 // Forward Declarations
@@ -119,6 +369,8 @@ static emote_handle_t InitializeEmote(const esp_lcd_panel_handle_t panel, const 
 EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel, const esp_lcd_panel_io_handle_t panel_io,
                            const int width, const int height)
 {
+    width_ = width;
+    height_ = height;
     emote_handle_ = InitializeEmote(panel, width, height);
 
     const esp_lcd_panel_io_callbacks_t cbs = {
@@ -132,6 +384,11 @@ EmoteDisplay::~EmoteDisplay()
     if (emote_handle_) {
         emote_deinit(emote_handle_);
         emote_handle_ = nullptr;
+    }
+    if (music_font_owned_ && music_font_) {
+        gfx_font_lv_delete(static_cast<lv_font_t*>(music_font_));
+        music_font_ = nullptr;
+        music_font_owned_ = false;
     }
 }
 
@@ -204,6 +461,150 @@ void EmoteDisplay::UpdateStatusBar(bool update_all)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to update battery status: %s", esp_err_to_name(ret));
     }
+}
+
+void EmoteDisplay::ClearChatMessages()
+{
+    if (!emote_handle_) {
+        return;
+    }
+
+    // Clearing a subtitle must not change the status icon. In particular,
+    // EVT_SPEAK hides the battery indicator and replaces it with a speaker.
+    gfx_obj_t* toast_label = emote_get_obj_by_name(emote_handle_, EMT_DEF_ELEM_TOAST_LABEL);
+    if (toast_label != nullptr) {
+        emote_lock(emote_handle_);
+        gfx_label_set_text(toast_label, "");
+        emote_unlock(emote_handle_);
+    }
+}
+
+bool EmoteDisplay::EnsureMusicUi()
+{
+    if (!emote_handle_) {
+        return false;
+    }
+    bool lyric_rows_ready = true;
+    for (auto* row : music_lyric_rows_) {
+        lyric_rows_ready = lyric_rows_ready && row != nullptr;
+    }
+    if (music_background_ && music_title_ && lyric_rows_ready) {
+        return true;
+    }
+
+    music_background_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "music_background");
+    music_title_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "music_title");
+    for (size_t i = 0; i < kMusicLyricRowCount; ++i) {
+        const std::string name = "music_lyric_" + std::to_string(i);
+        music_lyric_rows_[i] = emote_create_obj_by_type(
+            emote_handle_, EMOTE_OBJ_TYPE_LABEL, name.c_str());
+    }
+    lyric_rows_ready = true;
+    for (auto* row : music_lyric_rows_) {
+        lyric_rows_ready = lyric_rows_ready && row != nullptr;
+    }
+    if (!music_background_ || !music_title_ || !lyric_rows_ready) {
+        ESP_LOGE(TAG, "Failed to create music lyric UI");
+        return false;
+    }
+
+    music_font_ = LoadMusicFontFromAssets();
+    if (!music_font_) {
+        music_font_ = (gfx_font_t)&font_puhui_basic_20_4;
+        ESP_LOGW(TAG, "Emote common text font unavailable; using basic fallback");
+    } else {
+        music_font_owned_ = true;
+    }
+
+    emote_lock(emote_handle_);
+    const int music_height = std::max(1, height_ - kMusicStatusBarHeight);
+
+    gfx_obj_set_size(music_background_, width_, music_height);
+    gfx_obj_align(music_background_, GFX_ALIGN_BOTTOM_MID, 0, 0);
+    gfx_label_set_text(music_background_, "");
+    gfx_label_set_bg_color(music_background_, GFX_COLOR_HEX(0x080A12));
+    gfx_label_set_bg_enable(music_background_, true);
+
+    gfx_obj_set_size(music_title_, std::max(1, std::min(width_ - 16, width_ * 300 / 360)), 32);
+    gfx_obj_align(music_title_, GFX_ALIGN_TOP_MID, 0, kMusicStatusBarHeight + 4);
+    gfx_label_set_font(music_title_, music_font_);
+    gfx_label_set_color(music_title_, GFX_COLOR_HEX(0x62D9FF));
+    gfx_label_set_text_align(music_title_, GFX_TEXT_ALIGN_CENTER);
+    gfx_label_set_long_mode(music_title_, GFX_LABEL_LONG_SCROLL);
+    gfx_label_set_scroll_loop(music_title_, true);
+    gfx_label_set_scroll_speed(music_title_, 15);
+
+    for (size_t i = 0; i < kMusicLyricRowCount; ++i) {
+        const int row_width = std::max(1, std::min(width_ - 16, width_ * kMusicLyricRowWidth[i] / 360));
+        const int row_y = height_ * kMusicLyricRowY[i] / 360;
+        gfx_obj_set_size(music_lyric_rows_[i], row_width, kMusicLyricRowHeight);
+        gfx_obj_align(music_lyric_rows_[i], GFX_ALIGN_TOP_MID, 0, row_y);
+        gfx_label_set_font(music_lyric_rows_[i], music_font_);
+        gfx_label_set_color(music_lyric_rows_[i], GFX_COLOR_HEX(0xFFFFFF));
+        gfx_label_set_text_align(music_lyric_rows_[i], GFX_TEXT_ALIGN_CENTER);
+        gfx_label_set_long_mode(music_lyric_rows_[i], GFX_LABEL_LONG_CLIP);
+        gfx_label_set_text(music_lyric_rows_[i], "");
+    }
+
+    gfx_obj_set_visible(music_background_, false);
+    gfx_obj_set_visible(music_title_, false);
+    for (auto* row : music_lyric_rows_) {
+        gfx_obj_set_visible(row, false);
+    }
+    emote_unlock(emote_handle_);
+    return true;
+}
+
+void EmoteDisplay::SetMusicLyrics(const char* title, const char* lyrics)
+{
+    if (!emote_handle_ || !EnsureMusicUi()) {
+        return;
+    }
+
+    // EVT_SPEAK hides the battery and replaces it with the speaker icon. Keep
+    // music on an independent overlay and explicitly restore the idle status bar.
+    UpdateStatusBar();
+    emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_IDLE, nullptr);
+
+    std::array<int, kMusicLyricRowCount> row_widths = {};
+    for (size_t i = 0; i < kMusicLyricRowCount; ++i) {
+        row_widths[i] = std::max(1, std::min(width_ - 16, width_ * kMusicLyricRowWidth[i] / 360));
+    }
+    bool truncated = false;
+    const auto visual_rows = BuildCircularMusicLyricRows(lyrics, row_widths, &truncated);
+    (void)truncated;
+
+    emote_lock(emote_handle_);
+    gfx_label_set_text(music_title_, title ? title : "");
+    gfx_obj_set_visible(music_background_, true);
+    gfx_obj_set_visible(music_title_, true);
+    for (size_t i = 0; i < kMusicLyricRowCount; ++i) {
+        const bool has_text = i < visual_rows.size() && !visual_rows[i].text.empty();
+        gfx_label_set_text(music_lyric_rows_[i], has_text ? visual_rows[i].text.c_str() : "");
+        gfx_label_set_color(music_lyric_rows_[i],
+                            i < visual_rows.size() && visual_rows[i].current
+                                ? GFX_COLOR_HEX(0x62D9FF)
+                                : GFX_COLOR_HEX(0xFFFFFF));
+        gfx_obj_set_visible(music_lyric_rows_[i], has_text);
+    }
+    emote_unlock(emote_handle_);
+
+}
+
+void EmoteDisplay::ClearMusicLyrics()
+{
+    if (!emote_handle_ || !music_background_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    gfx_obj_set_visible(music_background_, false);
+    gfx_obj_set_visible(music_title_, false);
+    for (auto* row : music_lyric_rows_) {
+        if (row) {
+            gfx_obj_set_visible(row, false);
+        }
+    }
+    emote_unlock(emote_handle_);
 }
 
 void EmoteDisplay::SetPowerSaveMode(bool on)

@@ -17,6 +17,9 @@ public:
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetStatus(const char* status) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
+    virtual void ClearChatMessages() override;
+    virtual void SetMusicLyrics(const char* title, const char* lyrics) override;
+    virtual void ClearMusicLyrics() override;
     virtual void SetTheme(Theme* theme) override;
     virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
     virtual void UpdateStatusBar(bool update_all = false) override;
@@ -32,10 +35,19 @@ public:
     emote_handle_t GetEmoteHandle() const { return emote_handle_; }
 
 private:
+    static constexpr size_t kMusicLyricRowCount = 7;
+
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
 
     emote_handle_t emote_handle_ = nullptr;
+    gfx_font_t music_font_ = nullptr;
+    bool music_font_owned_ = false;
+    gfx_obj_t* music_background_ = nullptr;
+    gfx_obj_t* music_title_ = nullptr;
+    gfx_obj_t* music_lyric_rows_[kMusicLyricRowCount] = {};
+
+    bool EnsureMusicUi();
 
 };
 

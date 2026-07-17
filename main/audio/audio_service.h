@@ -88,10 +88,16 @@ enum AudioTaskType {
     kAudioTaskTypeDecodeToPlaybackQueue,
 };
 
+enum AudioPlaybackSource {
+    kAudioPlaybackSourceAssistant,
+    kAudioPlaybackSourceLocalMusic,
+};
+
 struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
     uint32_t timestamp;
+    AudioPlaybackSource source = kAudioPlaybackSourceAssistant;
 };
 
 struct DebugStatistics {
@@ -127,6 +133,9 @@ public:
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    bool PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, AudioPlaybackSource source,
+                                bool wait = true);
+    size_t ClearPlaybackQueue(AudioPlaybackSource source);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
