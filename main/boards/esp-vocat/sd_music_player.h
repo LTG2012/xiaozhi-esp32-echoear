@@ -56,6 +56,8 @@ private:
     int current_index_ = -1;
     uint32_t generation_ = 0;
     uint64_t submitted_samples_ = 0;
+    uint64_t total_samples_ = 0;
+    int displayed_progress_permille_ = -1;
     bool auto_paused_ = false;
     bool lyrics_available_ = false;
     int displayed_lyric_index_ = -1;
@@ -87,6 +89,7 @@ private:
     std::vector<LyricLine> LoadLyrics(const std::string& path);
     std::string BuildLyricsWindowLocked(int current_index) const;
     void UpdateLyrics(uint32_t generation);
+    void UpdateProgress(uint32_t generation, bool force = false);
     void ShowMusicText(const std::string& title, const std::string& lyric = "");
     void ClearMusicText();
     size_t ClearQueuedMusic();

@@ -37,6 +37,7 @@ public:
     virtual void SetChatMessage(const char* role, const char* content);
     virtual void ClearChatMessages();
     virtual void SetMusicLyrics(const char* title, const char* lyrics);
+    virtual void SetMusicProgress(int progress_permille);
     virtual void ClearMusicLyrics();
     virtual void SetTheme(Theme* theme);
     virtual Theme* GetTheme() { return current_theme_; }

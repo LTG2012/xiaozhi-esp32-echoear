@@ -52,6 +52,9 @@ void Display::ClearChatMessages() {
 void Display::SetMusicLyrics(const char* title, const char* lyrics) {
 }
 
+void Display::SetMusicProgress(int progress_permille) {
+}
+
 void Display::ClearMusicLyrics() {
 }
 

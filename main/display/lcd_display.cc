@@ -1107,6 +1107,26 @@ void LcdDisplay::SetMusicLyrics(const char* title, const char* lyrics) {
         lv_obj_set_style_text_font(music_lyrics_, text_font, 0);
         lv_obj_set_style_text_color(music_lyrics_, lv_color_white(), 0);
         lv_obj_set_style_text_line_space(music_lyrics_, 8, 0);
+
+        music_progress_ = lv_arc_create(music_overlay_);
+        const int arc_size = std::max(1, std::min(width_, height_) - 10);
+        lv_obj_set_size(music_progress_, arc_size, arc_size);
+        lv_obj_center(music_progress_);
+        lv_arc_set_bg_angles(music_progress_, 0, 180);
+        lv_arc_set_mode(music_progress_, LV_ARC_MODE_REVERSE);
+        lv_arc_set_range(music_progress_, 0, 1000);
+        lv_arc_set_value(music_progress_, 0);
+        lv_obj_set_style_arc_width(music_progress_, 6, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(music_progress_, lv_color_hex(0xD7DCE2), LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(music_progress_, 72, LV_PART_MAIN);
+        lv_obj_set_style_arc_rounded(music_progress_, true, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(music_progress_, 6, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(music_progress_, lv_color_hex(0x62D9FF), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_opa(music_progress_, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_rounded(music_progress_, true, LV_PART_INDICATOR);
+        lv_obj_set_style_opa(music_progress_, LV_OPA_TRANSP, LV_PART_KNOB);
+        lv_obj_remove_flag(music_progress_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(music_progress_, LV_OBJ_FLAG_HIDDEN);
     }
 
     lv_label_set_text(music_title_, title ? title : "");
@@ -1117,10 +1137,25 @@ void LcdDisplay::SetMusicLyrics(const char* title, const char* lyrics) {
     }
 }
 
+void LcdDisplay::SetMusicProgress(int progress_permille) {
+    if (!setup_ui_called_) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    if (music_progress_ == nullptr) {
+        return;
+    }
+    lv_arc_set_value(music_progress_, std::clamp(progress_permille, 0, 1000));
+    lv_obj_remove_flag(music_progress_, LV_OBJ_FLAG_HIDDEN);
+}
+
 void LcdDisplay::ClearMusicLyrics() {
     DisplayLockGuard lock(this);
     if (music_overlay_ != nullptr) {
         lv_obj_add_flag(music_overlay_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (music_progress_ != nullptr) {
+        lv_obj_add_flag(music_progress_, LV_OBJ_FLAG_HIDDEN);
     }
 }
 

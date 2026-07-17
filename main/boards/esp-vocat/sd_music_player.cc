@@ -284,6 +284,8 @@ void SdMusicPlayer::RegisterMcpTools() {
             }
             cJSON_AddNumberToObject(result, "progress_ms",
                                     submitted_samples_ * 1000ULL / kOutputSampleRate);
+            cJSON_AddNumberToObject(result, "duration_ms",
+                                    total_samples_ * 1000ULL / kOutputSampleRate);
             cJSON_AddBoolToObject(result, "lyrics", lyrics_available_);
             cJSON_AddNumberToObject(result, "song_count", songs_.size());
             return result;
@@ -353,6 +355,28 @@ SdMusicPlayer::DecodeResult SdMusicPlayer::DecodeSong(const Song& song, uint32_t
         MarkCardUnavailable();
         return DecodeResult::kError;
     }
+
+    uint64_t mp3_audio_bytes = 0;
+    if (fseek(file, 0, SEEK_END) == 0) {
+        const long file_size = ftell(file);
+        if (file_size > 0) {
+            mp3_audio_bytes = static_cast<uint64_t>(file_size);
+        }
+        rewind(file);
+    }
+    uint8_t id3_header[10] = {};
+    if (fread(id3_header, 1, sizeof(id3_header), file) == sizeof(id3_header) &&
+        std::memcmp(id3_header, "ID3", 3) == 0) {
+        const uint64_t id3_size = 10ULL +
+            (static_cast<uint64_t>(id3_header[6] & 0x7F) << 21) +
+            (static_cast<uint64_t>(id3_header[7] & 0x7F) << 14) +
+            (static_cast<uint64_t>(id3_header[8] & 0x7F) << 7) +
+            static_cast<uint64_t>(id3_header[9] & 0x7F);
+        if (id3_size < mp3_audio_bytes) {
+            mp3_audio_bytes -= id3_size;
+        }
+    }
+    rewind(file);
 
     esp_audio_simple_dec_cfg_t decoder_config = {
         .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
@@ -427,6 +451,26 @@ SdMusicPlayer::DecodeResult SdMusicPlayer::DecodeSong(const Song& song, uint32_t
                     ESP_LOGE(kTag, "Unsupported MP3 PCM format");
                     result = DecodeResult::kError;
                     break;
+                }
+
+                if (info.bitrate > 0 && mp3_audio_bytes > 0) {
+                    // Some MP3 decoder backends report kbps (for example 128),
+                    // while the public simple-decoder API documents bit/s.
+                    const uint64_t bitrate_bps = info.bitrate < 1000
+                        ? static_cast<uint64_t>(info.bitrate) * 1000ULL
+                        : static_cast<uint64_t>(info.bitrate);
+                    bool duration_ready = false;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (generation == generation_ && total_samples_ == 0) {
+                            total_samples_ = mp3_audio_bytes * 8ULL * kOutputSampleRate /
+                                             bitrate_bps;
+                            duration_ready = total_samples_ > 0;
+                        }
+                    }
+                    if (duration_ready) {
+                        UpdateProgress(generation, true);
+                    }
                 }
 
                 const auto* interleaved = reinterpret_cast<const int16_t*>(output.buffer);
@@ -562,6 +606,7 @@ bool SdMusicPlayer::SubmitPcmChunk(std::vector<int16_t>& chunk, uint32_t generat
         return false;
     }
     UpdateLyrics(generation);
+    UpdateProgress(generation);
     return true;
 }
 
@@ -605,6 +650,7 @@ bool SdMusicPlayer::WaitUntilPlayable(uint32_t generation) {
             }
             if (restore_text && !title.empty()) {
                 ShowMusicText(title, lyric_window);
+                UpdateProgress(generation, true);
             }
             return still_current;
         }
@@ -874,6 +920,8 @@ std::string SdMusicPlayer::Control(const std::string& action_value) {
             state_ = State::kStopped;
             current_index_ = -1;
             submitted_samples_ = 0;
+            total_samples_ = 0;
+            displayed_progress_permille_ = -1;
             auto_paused_ = false;
             lyrics_available_ = false;
             current_lyrics_.clear();
@@ -937,6 +985,8 @@ void SdMusicPlayer::SelectTrackLocked(int index) {
     current_index_ = index;
     state_ = State::kPlaying;
     submitted_samples_ = 0;
+    total_samples_ = 0;
+    displayed_progress_permille_ = -1;
     auto_paused_ = false;
     lyrics_available_ = false;
     displayed_lyric_index_ = -1;
@@ -1134,6 +1184,39 @@ void SdMusicPlayer::UpdateLyrics(uint32_t generation) {
     ShowMusicText(title, lyric_window);
 }
 
+void SdMusicPlayer::UpdateProgress(uint32_t generation, bool force) {
+    static constexpr int kProgressUiStepPermille = 5;
+    int progress_permille = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (generation != generation_ || state_ == State::kStopped || total_samples_ == 0) {
+            return;
+        }
+        progress_permille = static_cast<int>(std::min<uint64_t>(
+            1000, submitted_samples_ * 1000ULL / total_samples_));
+        if (!force && displayed_progress_permille_ >= 0 && progress_permille < 1000 &&
+            progress_permille - displayed_progress_permille_ < kProgressUiStepPermille) {
+            return;
+        }
+        displayed_progress_permille_ = progress_permille;
+    }
+    // Rendering the transparent 360x185 arc can occasionally take longer than
+    // the ~80 ms local-music PCM queue. Keep it off the decoder task so display
+    // work can never starve audio submission.
+    Application::GetInstance().Schedule([this, generation, progress_permille]() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (generation != generation_ || state_ != State::kPlaying || auto_paused_ ||
+                displayed_progress_permille_ != progress_permille) {
+                return;
+            }
+        }
+        if (auto* display = Board::GetInstance().GetDisplay()) {
+            display->SetMusicProgress(progress_permille);
+        }
+    });
+}
+
 void SdMusicPlayer::ShowMusicText(const std::string& title, const std::string& lyric) {
     if (auto* display = Board::GetInstance().GetDisplay()) {
         display->SetMusicLyrics(title.c_str(), lyric.c_str());
@@ -1153,6 +1236,7 @@ size_t SdMusicPlayer::ClearQueuedMusic() {
         std::lock_guard<std::mutex> lock(mutex_);
         submitted_samples_ = cleared >= submitted_samples_ ? 0 : submitted_samples_ - cleared;
         displayed_lyric_index_ = -1;
+        displayed_progress_permille_ = -1;
     }
     return cleared;
 }

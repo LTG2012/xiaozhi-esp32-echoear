@@ -11,6 +11,7 @@
 #include <tuple>
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 
 // Standard C headers
 #include <sys/time.h>
@@ -488,7 +489,7 @@ bool EmoteDisplay::EnsureMusicUi()
     for (auto* row : music_lyric_rows_) {
         lyric_rows_ready = lyric_rows_ready && row != nullptr;
     }
-    if (music_background_ && music_title_ && lyric_rows_ready) {
+    if (music_background_ && music_title_ && lyric_rows_ready && music_progress_) {
         return true;
     }
 
@@ -499,11 +500,14 @@ bool EmoteDisplay::EnsureMusicUi()
         music_lyric_rows_[i] = emote_create_obj_by_type(
             emote_handle_, EMOTE_OBJ_TYPE_LABEL, name.c_str());
     }
+    music_progress_ = emote_create_obj_by_type(
+        emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "music_progress");
     lyric_rows_ready = true;
     for (auto* row : music_lyric_rows_) {
         lyric_rows_ready = lyric_rows_ready && row != nullptr;
     }
-    if (!music_background_ || !music_title_ || !lyric_rows_ready) {
+    if (!music_background_ || !music_title_ || !lyric_rows_ready || !music_progress_ ||
+        !InitializeMusicProgressImage()) {
         ESP_LOGE(TAG, "Failed to create music lyric UI");
         return false;
     }
@@ -551,8 +555,97 @@ bool EmoteDisplay::EnsureMusicUi()
     for (auto* row : music_lyric_rows_) {
         gfx_obj_set_visible(row, false);
     }
+    gfx_img_set_src(music_progress_, &music_progress_image_);
+    gfx_obj_set_pos(music_progress_, 0, height_ / 2 - 5);
+    gfx_obj_set_visible(music_progress_, false);
+    music_progress_visible_ = false;
     emote_unlock(emote_handle_);
     return true;
+}
+
+bool EmoteDisplay::InitializeMusicProgressImage()
+{
+    if (!music_progress_image_data_.empty()) {
+        return true;
+    }
+
+    const int image_width = width_;
+    const int image_y = height_ / 2 - 5;
+    const int image_height = height_ - image_y;
+    if (image_width <= 0 || image_height <= 0) {
+        return false;
+    }
+
+    const size_t pixel_count = static_cast<size_t>(image_width) * image_height;
+    music_progress_image_data_.assign(pixel_count * 3, 0);
+    music_progress_pixels_.clear();
+    music_progress_thresholds_.clear();
+    music_progress_pixel_alphas_.clear();
+    music_progress_track_color_ = gfx_color_hex(0xD7DCE2).full;
+    music_progress_active_color_ = gfx_color_hex(0x62D9FF).full;
+
+    auto* colors = reinterpret_cast<uint16_t*>(music_progress_image_data_.data());
+    auto* alpha = music_progress_image_data_.data() + pixel_count * sizeof(uint16_t);
+    const double center_x = width_ / 2.0;
+    const double center_y = height_ / 2.0;
+    const double radius = std::min(width_, height_) / 2.0 - 8.0;
+    constexpr double half_width = 3.0;
+    constexpr double pi = 3.14159265358979323846;
+
+    for (int image_row = 0; image_row < image_height; ++image_row) {
+        const double y = image_y + image_row + 0.5;
+        const double dy = y - center_y;
+        for (int x = 0; x < image_width; ++x) {
+            const double dx = x + 0.5 - center_x;
+            double distance_to_line = 1000.0;
+            double fraction = 0.0;
+
+            if (dy >= 0.0) {
+                const double distance = std::sqrt(dx * dx + dy * dy);
+                distance_to_line = std::abs(distance - radius);
+                const double angle = std::atan2(dy, dx);
+                fraction = (pi - angle) / pi;
+            } else {
+                const double left_dx = dx + radius;
+                const double right_dx = dx - radius;
+                const double left_distance = std::sqrt(left_dx * left_dx + dy * dy);
+                const double right_distance = std::sqrt(right_dx * right_dx + dy * dy);
+                if (left_distance <= right_distance) {
+                    distance_to_line = left_distance;
+                    fraction = 0.0;
+                } else {
+                    distance_to_line = right_distance;
+                    fraction = 1.0;
+                }
+            }
+
+            const double edge_alpha = half_width + 1.0 - distance_to_line;
+            if (edge_alpha <= 0.0) {
+                continue;
+            }
+            const size_t pixel = static_cast<size_t>(image_row) * image_width + x;
+            colors[pixel] = music_progress_track_color_;
+            const uint8_t pixel_alpha = static_cast<uint8_t>(
+                std::min(255.0, std::max(0.0, edge_alpha * 255.0)));
+            alpha[pixel] = static_cast<uint8_t>(
+                (static_cast<uint16_t>(pixel_alpha) * 72U + 127U) / 255U);
+            music_progress_pixels_.push_back(static_cast<uint32_t>(pixel));
+            music_progress_thresholds_.push_back(static_cast<uint16_t>(
+                std::lround(std::clamp(fraction, 0.0, 1.0) * 1000.0)));
+            music_progress_pixel_alphas_.push_back(pixel_alpha);
+        }
+    }
+
+    music_progress_image_.header.magic = C_ARRAY_HEADER_MAGIC;
+    music_progress_image_.header.cf = GFX_COLOR_FORMAT_RGB565A8;
+    music_progress_image_.header.flags = 0;
+    music_progress_image_.header.w = image_width;
+    music_progress_image_.header.h = image_height;
+    music_progress_image_.header.stride = image_width * sizeof(uint16_t);
+    music_progress_image_.header.reserved = 0;
+    music_progress_image_.data_size = music_progress_image_data_.size();
+    music_progress_image_.data = music_progress_image_data_.data();
+    return !music_progress_pixels_.empty();
 }
 
 void EmoteDisplay::SetMusicLyrics(const char* title, const char* lyrics)
@@ -591,6 +684,35 @@ void EmoteDisplay::SetMusicLyrics(const char* title, const char* lyrics)
 
 }
 
+void EmoteDisplay::SetMusicProgress(int progress_permille)
+{
+    if (!emote_handle_ || !EnsureMusicUi()) {
+        return;
+    }
+
+    const uint16_t progress = static_cast<uint16_t>(std::clamp(progress_permille, 0, 1000));
+    emote_lock(emote_handle_);
+    auto* colors = reinterpret_cast<uint16_t*>(music_progress_image_data_.data());
+    auto* alpha = music_progress_image_data_.data() +
+        static_cast<size_t>(music_progress_image_.header.w) *
+        music_progress_image_.header.h * sizeof(uint16_t);
+    for (size_t i = 0; i < music_progress_pixels_.size(); ++i) {
+        const bool played = music_progress_thresholds_[i] <= progress;
+        const uint32_t pixel = music_progress_pixels_[i];
+        colors[pixel] = played ? music_progress_active_color_ : music_progress_track_color_;
+        alpha[pixel] = played
+            ? music_progress_pixel_alphas_[i]
+            : static_cast<uint8_t>(
+                (static_cast<uint16_t>(music_progress_pixel_alphas_[i]) * 72U + 127U) / 255U);
+    }
+    gfx_img_set_src(music_progress_, &music_progress_image_);
+    if (!music_progress_visible_) {
+        gfx_obj_set_visible(music_progress_, true);
+        music_progress_visible_ = true;
+    }
+    emote_unlock(emote_handle_);
+}
+
 void EmoteDisplay::ClearMusicLyrics()
 {
     if (!emote_handle_ || !music_background_) {
@@ -603,6 +725,10 @@ void EmoteDisplay::ClearMusicLyrics()
         if (row) {
             gfx_obj_set_visible(row, false);
         }
+    }
+    if (music_progress_) {
+        gfx_obj_set_visible(music_progress_, false);
+        music_progress_visible_ = false;
     }
     emote_unlock(emote_handle_);
 }
