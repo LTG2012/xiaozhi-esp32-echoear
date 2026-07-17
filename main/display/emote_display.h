@@ -22,6 +22,8 @@ public:
     virtual void ClearChatMessages() override;
     virtual void SetMusicLyrics(const char* title, const char* lyrics) override;
     virtual void SetMusicProgress(int progress_permille) override;
+    virtual void SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
+                                      int level_0, int level_1, int level_2) override;
     virtual void ClearMusicLyrics() override;
     virtual void SetTheme(Theme* theme) override;
     virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
@@ -49,6 +51,10 @@ private:
     gfx_obj_t* music_background_ = nullptr;
     gfx_obj_t* music_title_ = nullptr;
     gfx_obj_t* music_lyric_rows_[kMusicLyricRowCount] = {};
+    gfx_obj_t* music_time_ = nullptr;
+    gfx_image_dsc_t music_time_image_ = {};
+    std::vector<uint8_t> music_time_image_data_;
+    gfx_obj_t* music_rhythm_bars_[6] = {};
     gfx_obj_t* music_progress_ = nullptr;
     gfx_image_dsc_t music_progress_image_ = {};
     std::vector<uint8_t> music_progress_image_data_;
@@ -58,8 +64,14 @@ private:
     uint16_t music_progress_track_color_ = 0;
     uint16_t music_progress_active_color_ = 0;
     bool music_progress_visible_ = false;
+    bool music_playback_info_visible_ = false;
+    int music_elapsed_seconds_ = -1;
+    int music_total_seconds_ = -1;
+    int music_rhythm_heights_[3] = {};
 
     bool EnsureMusicUi();
+    bool InitializeMusicTimeImage();
+    void RenderMusicTimeImage(const std::string& text);
     bool InitializeMusicProgressImage();
 
 };

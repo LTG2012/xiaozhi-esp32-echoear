@@ -6,6 +6,8 @@
 
 #include <vector>
 #include <algorithm>
+#include <cstdio>
+#include <string>
 #include <font_awesome.h>
 #include <esp_log.h>
 #include <esp_err.h>
@@ -21,6 +23,36 @@
 LV_FONT_DECLARE(BUILTIN_TEXT_FONT);
 LV_FONT_DECLARE(BUILTIN_ICON_FONT);
 LV_FONT_DECLARE(font_awesome_30_4);
+
+namespace {
+
+constexpr int kMusicTimeY = 319;
+constexpr int kMusicRhythmBottomY = 331;
+constexpr int kMusicRhythmBarWidth = 4;
+constexpr int kMusicRhythmLeftX[3] = {107, 112, 117};
+constexpr uint32_t kMusicRhythmColors[3] = {0x2F7185, 0x46A9C7, 0x62D9FF};
+
+std::string FormatMusicPlaybackTime(int elapsed_seconds, int total_seconds) {
+    elapsed_seconds = std::max(0, elapsed_seconds);
+    char text[24] = {};
+    if (total_seconds <= 0) {
+        snprintf(text, sizeof(text), "%d:%02d/--:--",
+                 elapsed_seconds / 60, elapsed_seconds % 60);
+    } else if (total_seconds < 3600) {
+        elapsed_seconds = std::min(elapsed_seconds, total_seconds);
+        snprintf(text, sizeof(text), "%d:%02d/%d:%02d",
+                 elapsed_seconds / 60, elapsed_seconds % 60,
+                 total_seconds / 60, total_seconds % 60);
+    } else {
+        elapsed_seconds = std::min(elapsed_seconds, total_seconds);
+        snprintf(text, sizeof(text), "%d:%02d/%d:%02d",
+                 elapsed_seconds / 3600, (elapsed_seconds % 3600) / 60,
+                 total_seconds / 3600, (total_seconds % 3600) / 60);
+    }
+    return text;
+}
+
+}  // namespace
 
 void LcdDisplay::InitializeLcdThemes() {
     auto text_font = std::make_shared<LvglBuiltInFont>(&BUILTIN_TEXT_FONT);
@@ -1100,13 +1132,44 @@ void LcdDisplay::SetMusicLyrics(const char* title, const char* lyrics) {
         lv_obj_set_style_text_color(music_title_, lv_color_hex(0x62D9FF), 0);
 
         music_lyrics_ = lv_label_create(music_overlay_);
-        lv_obj_set_size(music_lyrics_, LV_PCT(92), std::max(1, height_ - 120));
+        lv_obj_set_size(music_lyrics_, LV_PCT(92), std::max(1, height_ - 152));
         lv_obj_align(music_lyrics_, LV_ALIGN_TOP_MID, 0, 110);
         lv_label_set_long_mode(music_lyrics_, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_align(music_lyrics_, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_font(music_lyrics_, text_font, 0);
         lv_obj_set_style_text_color(music_lyrics_, lv_color_white(), 0);
         lv_obj_set_style_text_line_space(music_lyrics_, 8, 0);
+
+        music_time_ = lv_label_create(music_overlay_);
+        lv_obj_set_size(music_time_, std::max(1, width_ * 122 / 360), 22);
+        lv_obj_align(music_time_, LV_ALIGN_TOP_MID, 0, height_ * kMusicTimeY / 360);
+        lv_label_set_long_mode(music_time_, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_align(music_time_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(music_time_, text_font, 0);
+        lv_obj_set_style_text_color(music_time_, lv_color_hex(0xD7DCE2), 0);
+        lv_label_set_text(music_time_, "0:00/--:--");
+        lv_obj_add_flag(music_time_, LV_OBJ_FLAG_HIDDEN);
+
+        const int bar_width = std::max(2, width_ * kMusicRhythmBarWidth / 360);
+        const int bar_bottom = height_ * kMusicRhythmBottomY / 360;
+        for (size_t i = 0; i < 3; ++i) {
+            const int left_x = width_ * kMusicRhythmLeftX[i] / 360;
+            const int right_x = width_ - left_x - bar_width;
+            for (size_t side = 0; side < 2; ++side) {
+                auto* bar = lv_obj_create(music_overlay_);
+                music_rhythm_bars_[i + side * 3] = bar;
+                lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_remove_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_set_size(bar, bar_width, 1);
+                lv_obj_set_pos(bar, side == 0 ? left_x : right_x, bar_bottom - 1);
+                lv_obj_set_style_radius(bar, 2, 0);
+                lv_obj_set_style_border_width(bar, 0, 0);
+                lv_obj_set_style_pad_all(bar, 0, 0);
+                lv_obj_set_style_bg_color(bar, lv_color_hex(kMusicRhythmColors[i]), 0);
+                lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+                lv_obj_add_flag(bar, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
 
         music_progress_ = lv_arc_create(music_overlay_);
         const int arc_size = std::max(1, std::min(width_, height_) - 10);
@@ -1131,6 +1194,14 @@ void LcdDisplay::SetMusicLyrics(const char* title, const char* lyrics) {
 
     lv_label_set_text(music_title_, title ? title : "");
     lv_label_set_text(music_lyrics_, lyrics ? lyrics : "");
+    if (!music_playback_info_visible_) {
+        lv_label_set_text(music_time_, "0:00/--:--");
+        lv_obj_remove_flag(music_time_, LV_OBJ_FLAG_HIDDEN);
+        for (auto* bar : music_rhythm_bars_) {
+            lv_obj_remove_flag(bar, LV_OBJ_FLAG_HIDDEN);
+        }
+        music_playback_info_visible_ = true;
+    }
     lv_obj_remove_flag(music_overlay_, LV_OBJ_FLAG_HIDDEN);
     if (top_bar_ != nullptr) {
         lv_obj_move_foreground(top_bar_);
@@ -1149,6 +1220,50 @@ void LcdDisplay::SetMusicProgress(int progress_permille) {
     lv_obj_remove_flag(music_progress_, LV_OBJ_FLAG_HIDDEN);
 }
 
+void LcdDisplay::SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
+                                      int level_0, int level_1, int level_2) {
+    if (!setup_ui_called_) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    if (music_time_ == nullptr) {
+        return;
+    }
+
+    if (elapsed_seconds != music_elapsed_seconds_ || total_seconds != music_total_seconds_) {
+        const std::string time = FormatMusicPlaybackTime(elapsed_seconds, total_seconds);
+        lv_label_set_text(music_time_, time.c_str());
+        music_elapsed_seconds_ = elapsed_seconds;
+        music_total_seconds_ = total_seconds;
+    }
+    const int levels[3] = {
+        std::clamp(level_0, 0, 1000),
+        std::clamp(level_1, 0, 1000),
+        std::clamp(level_2, 0, 1000),
+    };
+    const int bar_width = std::max(2, width_ * kMusicRhythmBarWidth / 360);
+    const int bar_bottom = height_ * kMusicRhythmBottomY / 360;
+    for (size_t i = 0; i < 3; ++i) {
+        const int height = 1 + levels[i] * 9 / 1000;
+        if (height != music_rhythm_heights_[i]) {
+            const int left_x = width_ * kMusicRhythmLeftX[i] / 360;
+            const int right_x = width_ - left_x - bar_width;
+            lv_obj_set_size(music_rhythm_bars_[i], bar_width, height);
+            lv_obj_set_pos(music_rhythm_bars_[i], left_x, bar_bottom - height);
+            lv_obj_set_size(music_rhythm_bars_[i + 3], bar_width, height);
+            lv_obj_set_pos(music_rhythm_bars_[i + 3], right_x, bar_bottom - height);
+            music_rhythm_heights_[i] = height;
+        }
+    }
+    if (!music_playback_info_visible_) {
+        lv_obj_remove_flag(music_time_, LV_OBJ_FLAG_HIDDEN);
+        for (auto* bar : music_rhythm_bars_) {
+            lv_obj_remove_flag(bar, LV_OBJ_FLAG_HIDDEN);
+        }
+        music_playback_info_visible_ = true;
+    }
+}
+
 void LcdDisplay::ClearMusicLyrics() {
     DisplayLockGuard lock(this);
     if (music_overlay_ != nullptr) {
@@ -1157,6 +1272,15 @@ void LcdDisplay::ClearMusicLyrics() {
     if (music_progress_ != nullptr) {
         lv_obj_add_flag(music_progress_, LV_OBJ_FLAG_HIDDEN);
     }
+    if (music_time_ != nullptr) {
+        lv_obj_add_flag(music_time_, LV_OBJ_FLAG_HIDDEN);
+    }
+    for (auto* bar : music_rhythm_bars_) {
+        if (bar != nullptr) {
+            lv_obj_add_flag(bar, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    music_playback_info_visible_ = false;
 }
 
 void LcdDisplay::SetEmotion(const char* emotion) {

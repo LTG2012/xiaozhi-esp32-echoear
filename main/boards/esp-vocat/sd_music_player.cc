@@ -475,6 +475,7 @@ SdMusicPlayer::DecodeResult SdMusicPlayer::DecodeSong(const Song& song, uint32_t
                     }
                     if (duration_ready) {
                         UpdateProgress(generation, true);
+                        UpdatePlaybackVisualization(generation, -1, true);
                     }
                 }
 
@@ -593,6 +594,13 @@ bool SdMusicPlayer::SubmitPcmChunk(std::vector<int16_t>& chunk, uint32_t generat
     }
     auto& audio = Application::GetInstance().GetAudioService();
     const size_t sample_count = chunk.size();
+    uint64_t absolute_sum = 0;
+    for (const int16_t sample : chunk) {
+        absolute_sum += static_cast<uint32_t>(std::abs(static_cast<int32_t>(sample)));
+    }
+    const int mean_absolute_sample = sample_count == 0
+        ? 0
+        : static_cast<int>(absolute_sum / sample_count);
     if (!audio.PushPcmToPlaybackQueue(std::move(chunk), kAudioPlaybackSourceLocalMusic, true)) {
         return false;
     }
@@ -612,6 +620,7 @@ bool SdMusicPlayer::SubmitPcmChunk(std::vector<int16_t>& chunk, uint32_t generat
     }
     UpdateLyrics(generation);
     UpdateProgress(generation);
+    UpdatePlaybackVisualization(generation, mean_absolute_sample);
     return true;
 }
 
@@ -656,6 +665,7 @@ bool SdMusicPlayer::WaitUntilPlayable(uint32_t generation) {
             if (restore_text && !title.empty()) {
                 ShowMusicText(title, lyric_window);
                 UpdateProgress(generation, true);
+                UpdatePlaybackVisualization(generation, -1, true);
             }
             return still_current;
         }
@@ -876,6 +886,8 @@ std::string SdMusicPlayer::Control(const std::string& action_value) {
             state_ = State::kStopped;
             current_index_ = -1;
             scanned_ = false;
+            playback_ui_task_pending_ = false;
+            pending_playback_ui_generation_ = generation_;
         }
         if (worker_task_ != nullptr) {
             xTaskNotifyGive(worker_task_);
@@ -891,6 +903,7 @@ std::string SdMusicPlayer::Control(const std::string& action_value) {
     }
 
     if (action == "pause") {
+        uint32_t paused_generation = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_ == State::kStopped) {
@@ -898,8 +911,12 @@ std::string SdMusicPlayer::Control(const std::string& action_value) {
             }
             state_ = State::kPaused;
             auto_paused_ = false;
+            paused_generation = generation_;
+            smoothed_music_level_ = 0;
+            std::fill(std::begin(music_level_history_), std::end(music_level_history_), 0);
         }
         ClearQueuedMusic();
+        UpdatePlaybackVisualization(paused_generation, -1, true);
         if (worker_task_ != nullptr) {
             xTaskNotifyGive(worker_task_);
         }
@@ -927,6 +944,11 @@ std::string SdMusicPlayer::Control(const std::string& action_value) {
             submitted_samples_ = 0;
             total_samples_ = 0;
             displayed_progress_permille_ = -1;
+            next_playback_ui_sample_ = 0;
+            smoothed_music_level_ = 0;
+            std::fill(std::begin(music_level_history_), std::end(music_level_history_), 0);
+            playback_ui_task_pending_ = false;
+            pending_playback_ui_generation_ = generation_;
             auto_paused_ = false;
             lyrics_available_ = false;
             current_lyrics_.clear();
@@ -992,6 +1014,11 @@ void SdMusicPlayer::SelectTrackLocked(int index) {
     submitted_samples_ = 0;
     total_samples_ = 0;
     displayed_progress_permille_ = -1;
+    next_playback_ui_sample_ = 0;
+    smoothed_music_level_ = 0;
+    std::fill(std::begin(music_level_history_), std::end(music_level_history_), 0);
+    playback_ui_task_pending_ = false;
+    pending_playback_ui_generation_ = generation_;
     auto_paused_ = false;
     lyrics_available_ = false;
     displayed_lyric_index_ = -1;
@@ -1218,6 +1245,74 @@ void SdMusicPlayer::UpdateProgress(uint32_t generation, bool force) {
         }
         if (auto* display = Board::GetInstance().GetDisplay()) {
             display->SetMusicProgress(progress_permille);
+        }
+    });
+}
+
+void SdMusicPlayer::UpdatePlaybackVisualization(uint32_t generation,
+                                                int mean_absolute_sample,
+                                                bool force) {
+    static constexpr uint64_t kUiIntervalSamples = kOutputSampleRate / 10;
+    bool schedule_task = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (generation != generation_ || state_ == State::kStopped) {
+            return;
+        }
+
+        if (mean_absolute_sample >= 0) {
+            const int raw_level = std::clamp(
+                (mean_absolute_sample - 200) * 1000 / 7000, 0, 1000);
+            if (raw_level >= smoothed_music_level_) {
+                smoothed_music_level_ = (smoothed_music_level_ + raw_level * 3) / 4;
+            } else {
+                smoothed_music_level_ = (smoothed_music_level_ * 3 + raw_level) / 4;
+            }
+        }
+
+        if (!force && submitted_samples_ < next_playback_ui_sample_) {
+            return;
+        }
+        next_playback_ui_sample_ = submitted_samples_ + kUiIntervalSamples;
+        music_level_history_[0] = music_level_history_[1];
+        music_level_history_[1] = music_level_history_[2];
+        music_level_history_[2] = smoothed_music_level_;
+
+        pending_elapsed_seconds_ = static_cast<int>(submitted_samples_ / kOutputSampleRate);
+        pending_total_seconds_ = static_cast<int>(total_samples_ / kOutputSampleRate);
+        std::copy(std::begin(music_level_history_), std::end(music_level_history_),
+                  std::begin(pending_music_levels_));
+        pending_playback_ui_generation_ = generation;
+        if (!playback_ui_task_pending_) {
+            playback_ui_task_pending_ = true;
+            schedule_task = true;
+        }
+    }
+
+    if (!schedule_task) {
+        return;
+    }
+    Application::GetInstance().Schedule([this, generation]() {
+        int elapsed_seconds = 0;
+        int total_seconds = 0;
+        int levels[3] = {};
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_playback_ui_generation_ != generation) {
+                return;
+            }
+            playback_ui_task_pending_ = false;
+            if (generation != generation_ || state_ == State::kStopped || auto_paused_) {
+                return;
+            }
+            elapsed_seconds = pending_elapsed_seconds_;
+            total_seconds = pending_total_seconds_;
+            std::copy(std::begin(pending_music_levels_), std::end(pending_music_levels_),
+                      std::begin(levels));
+        }
+        if (auto* display = Board::GetInstance().GetDisplay()) {
+            display->SetMusicPlaybackInfo(elapsed_seconds, total_seconds,
+                                          levels[0], levels[1], levels[2]);
         }
     });
 }

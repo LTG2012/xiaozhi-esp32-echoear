@@ -55,6 +55,10 @@ void Display::SetMusicLyrics(const char* title, const char* lyrics) {
 void Display::SetMusicProgress(int progress_permille) {
 }
 
+void Display::SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
+                                   int level_0, int level_1, int level_2) {
+}
+
 void Display::ClearMusicLyrics() {
 }
 

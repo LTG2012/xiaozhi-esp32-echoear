@@ -54,6 +54,36 @@ static constexpr std::array<int, kMusicLyricRowCount> kMusicLyricRowY = {
 static constexpr std::array<int, kMusicLyricRowCount> kMusicLyricRowWidth = {
     324, 340, 344, 340, 324, 292, 244,
 };
+static constexpr int kMusicTimeY = 319;
+static constexpr int kMusicTimeWidth = 122;
+static constexpr int kMusicTimeHeight = 18;
+static constexpr int kMusicRhythmBottomY = 331;
+static constexpr int kMusicRhythmBarWidth = 4;
+static constexpr std::array<int, 3> kMusicRhythmLeftX = {107, 112, 117};
+static constexpr std::array<uint32_t, 3> kMusicRhythmColors = {
+    0x2F7185, 0x46A9C7, 0x62D9FF,
+};
+
+static std::string FormatMusicPlaybackTime(int elapsed_seconds, int total_seconds)
+{
+    elapsed_seconds = std::max(0, elapsed_seconds);
+    char text[24] = {};
+    if (total_seconds <= 0) {
+        snprintf(text, sizeof(text), "%d:%02d/--:--",
+                 elapsed_seconds / 60, elapsed_seconds % 60);
+    } else if (total_seconds < 3600) {
+        elapsed_seconds = std::min(elapsed_seconds, total_seconds);
+        snprintf(text, sizeof(text), "%d:%02d/%d:%02d",
+                 elapsed_seconds / 60, elapsed_seconds % 60,
+                 total_seconds / 60, total_seconds % 60);
+    } else {
+        elapsed_seconds = std::min(elapsed_seconds, total_seconds);
+        snprintf(text, sizeof(text), "%d:%02d/%d:%02d",
+                 elapsed_seconds / 3600, (elapsed_seconds % 3600) / 60,
+                 total_seconds / 3600, (total_seconds % 3600) / 60);
+    }
+    return text;
+}
 
 struct MusicLyricSourceLine {
     std::string text;
@@ -489,7 +519,12 @@ bool EmoteDisplay::EnsureMusicUi()
     for (auto* row : music_lyric_rows_) {
         lyric_rows_ready = lyric_rows_ready && row != nullptr;
     }
-    if (music_background_ && music_title_ && lyric_rows_ready && music_progress_) {
+    bool rhythm_bars_ready = true;
+    for (auto* bar : music_rhythm_bars_) {
+        rhythm_bars_ready = rhythm_bars_ready && bar != nullptr;
+    }
+    if (music_background_ && music_title_ && lyric_rows_ready && music_time_ &&
+        rhythm_bars_ready && music_progress_) {
         return true;
     }
 
@@ -500,13 +535,28 @@ bool EmoteDisplay::EnsureMusicUi()
         music_lyric_rows_[i] = emote_create_obj_by_type(
             emote_handle_, EMOTE_OBJ_TYPE_LABEL, name.c_str());
     }
+    // The renderer paints objects in creation order. Create the full-screen
+    // transparent progress image first so the compact time and rhythm controls
+    // are guaranteed to stay above it.
     music_progress_ = emote_create_obj_by_type(
         emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "music_progress");
+    music_time_ = emote_create_obj_by_type(
+        emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "music_time");
+    for (size_t i = 0; i < 6; ++i) {
+        const std::string name = "music_rhythm_" + std::to_string(i);
+        music_rhythm_bars_[i] = emote_create_obj_by_type(
+            emote_handle_, EMOTE_OBJ_TYPE_LABEL, name.c_str());
+    }
     lyric_rows_ready = true;
     for (auto* row : music_lyric_rows_) {
         lyric_rows_ready = lyric_rows_ready && row != nullptr;
     }
-    if (!music_background_ || !music_title_ || !lyric_rows_ready || !music_progress_ ||
+    rhythm_bars_ready = true;
+    for (auto* bar : music_rhythm_bars_) {
+        rhythm_bars_ready = rhythm_bars_ready && bar != nullptr;
+    }
+    if (!music_background_ || !music_title_ || !lyric_rows_ready || !music_time_ ||
+        !rhythm_bars_ready || !music_progress_ || !InitializeMusicTimeImage() ||
         !InitializeMusicProgressImage()) {
         ESP_LOGE(TAG, "Failed to create music lyric UI");
         return false;
@@ -550,10 +600,34 @@ bool EmoteDisplay::EnsureMusicUi()
         gfx_label_set_text(music_lyric_rows_[i], "");
     }
 
+    const int time_y = height_ * kMusicTimeY / 360;
+    RenderMusicTimeImage("0:00/--:--");
+    gfx_img_set_src(music_time_, &music_time_image_);
+    gfx_obj_set_pos(music_time_, (width_ - kMusicTimeWidth) / 2, time_y);
+
+    const int bar_width = std::max(2, width_ * kMusicRhythmBarWidth / 360);
+    const int bar_bottom = height_ * kMusicRhythmBottomY / 360;
+    for (size_t i = 0; i < 3; ++i) {
+        const int left_x = width_ * kMusicRhythmLeftX[i] / 360;
+        const int right_x = width_ - left_x - bar_width;
+        for (size_t side = 0; side < 2; ++side) {
+            auto* bar = music_rhythm_bars_[i + side * 3];
+            gfx_obj_set_size(bar, bar_width, 1);
+            gfx_obj_set_pos(bar, side == 0 ? left_x : right_x, bar_bottom - 1);
+            gfx_label_set_text(bar, "");
+            gfx_label_set_bg_color(bar, GFX_COLOR_HEX(kMusicRhythmColors[i]));
+            gfx_label_set_bg_enable(bar, true);
+        }
+    }
+
     gfx_obj_set_visible(music_background_, false);
     gfx_obj_set_visible(music_title_, false);
     for (auto* row : music_lyric_rows_) {
         gfx_obj_set_visible(row, false);
+    }
+    gfx_obj_set_visible(music_time_, false);
+    for (auto* bar : music_rhythm_bars_) {
+        gfx_obj_set_visible(bar, false);
     }
     gfx_img_set_src(music_progress_, &music_progress_image_);
     gfx_obj_set_pos(music_progress_, 0, height_ / 2 - 5);
@@ -561,6 +635,116 @@ bool EmoteDisplay::EnsureMusicUi()
     music_progress_visible_ = false;
     emote_unlock(emote_handle_);
     return true;
+}
+
+bool EmoteDisplay::InitializeMusicTimeImage()
+{
+    if (!music_time_image_data_.empty()) {
+        return true;
+    }
+
+    const size_t pixel_count = static_cast<size_t>(kMusicTimeWidth) * kMusicTimeHeight;
+    music_time_image_data_.assign(pixel_count * 3, 0);
+    music_time_image_.header.magic = C_ARRAY_HEADER_MAGIC;
+    music_time_image_.header.cf = GFX_COLOR_FORMAT_RGB565A8;
+    music_time_image_.header.flags = 0;
+    music_time_image_.header.w = kMusicTimeWidth;
+    music_time_image_.header.h = kMusicTimeHeight;
+    music_time_image_.header.stride = kMusicTimeWidth * sizeof(uint16_t);
+    music_time_image_.header.reserved = 0;
+    music_time_image_.data_size = music_time_image_data_.size();
+    music_time_image_.data = music_time_image_data_.data();
+    return true;
+}
+
+void EmoteDisplay::RenderMusicTimeImage(const std::string& text)
+{
+    if (!InitializeMusicTimeImage()) {
+        return;
+    }
+
+    static constexpr uint8_t kDigits[10][7] = {
+        {0xF, 0x9, 0x9, 0x9, 0x9, 0x9, 0xF},
+        {0x6, 0x2, 0x2, 0x2, 0x2, 0x2, 0x7},
+        {0xF, 0x1, 0x1, 0xF, 0x8, 0x8, 0xF},
+        {0xF, 0x1, 0x1, 0x7, 0x1, 0x1, 0xF},
+        {0x9, 0x9, 0x9, 0xF, 0x1, 0x1, 0x1},
+        {0xF, 0x8, 0x8, 0xF, 0x1, 0x1, 0xF},
+        {0xF, 0x8, 0x8, 0xF, 0x9, 0x9, 0xF},
+        {0xF, 0x1, 0x1, 0x2, 0x2, 0x4, 0x4},
+        {0xF, 0x9, 0x9, 0xF, 0x9, 0x9, 0xF},
+        {0xF, 0x9, 0x9, 0xF, 0x1, 0x1, 0xF},
+    };
+    static constexpr uint8_t kColon[7] = {0, 0, 0x2, 0, 0, 0x2, 0};
+    static constexpr uint8_t kSlash[7] = {0x1, 0x1, 0x2, 0x2, 0x4, 0x4, 0x8};
+    static constexpr uint8_t kHyphen[7] = {0, 0, 0, 0xF, 0, 0, 0};
+    static constexpr int kScale = 2;
+    static constexpr int kGap = 2;
+
+    auto glyph_width = [](char character) {
+        return character == ':' ? 2 : 4;
+    };
+
+    int total_width = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        total_width += glyph_width(text[i]) * kScale;
+        if (i + 1 < text.size()) {
+            total_width += kGap;
+        }
+    }
+
+    std::fill(music_time_image_data_.begin(), music_time_image_data_.end(), 0);
+    const size_t pixel_count = static_cast<size_t>(kMusicTimeWidth) * kMusicTimeHeight;
+    auto* colors = reinterpret_cast<uint16_t*>(music_time_image_data_.data());
+    auto* alpha = music_time_image_data_.data() + pixel_count * sizeof(uint16_t);
+    const uint16_t elapsed_color = __builtin_bswap16(gfx_color_hex(0x62D9FF).full);
+    const uint16_t total_color = __builtin_bswap16(gfx_color_hex(0xD7DCE2).full);
+    const size_t slash_position = text.find('/');
+    int cursor_x = std::max(0, (kMusicTimeWidth - total_width) / 2);
+    constexpr int start_y = (kMusicTimeHeight - 7 * kScale) / 2;
+
+    for (size_t index = 0; index < text.size(); ++index) {
+        const char character = text[index];
+        const uint8_t* rows = nullptr;
+        if (character >= '0' && character <= '9') {
+            rows = kDigits[character - '0'];
+        } else if (character == ':') {
+            rows = kColon;
+        } else if (character == '/') {
+            rows = kSlash;
+        } else if (character == '-') {
+            rows = kHyphen;
+        }
+
+        const int width = glyph_width(character);
+        const uint16_t color = slash_position == std::string::npos || index < slash_position
+            ? elapsed_color
+            : total_color;
+        if (rows != nullptr) {
+            for (int row = 0; row < 7; ++row) {
+                for (int column = 0; column < width; ++column) {
+                    if ((rows[row] & (1U << (width - 1 - column))) == 0) {
+                        continue;
+                    }
+                    for (int y = 0; y < kScale; ++y) {
+                        for (int x = 0; x < kScale; ++x) {
+                            const int pixel_x = cursor_x + column * kScale + x;
+                            const int pixel_y = start_y + row * kScale + y;
+                            if (pixel_x < 0 || pixel_x >= kMusicTimeWidth ||
+                                pixel_y < 0 || pixel_y >= kMusicTimeHeight) {
+                                continue;
+                            }
+                            const size_t pixel = static_cast<size_t>(pixel_y) *
+                                kMusicTimeWidth + pixel_x;
+                            colors[pixel] = color;
+                            alpha[pixel] = 255;
+                        }
+                    }
+                }
+            }
+        }
+        cursor_x += width * kScale + kGap;
+    }
 }
 
 bool EmoteDisplay::InitializeMusicProgressImage()
@@ -581,8 +765,10 @@ bool EmoteDisplay::InitializeMusicProgressImage()
     music_progress_pixels_.clear();
     music_progress_thresholds_.clear();
     music_progress_pixel_alphas_.clear();
-    music_progress_track_color_ = gfx_color_hex(0xD7DCE2).full;
-    music_progress_active_color_ = gfx_color_hex(0x62D9FF).full;
+    // Image pixels are copied directly into the byte-swapped panel buffer when
+    // alpha is fully opaque, so store RGB565 in panel byte order.
+    music_progress_track_color_ = __builtin_bswap16(gfx_color_hex(0xD7DCE2).full);
+    music_progress_active_color_ = __builtin_bswap16(gfx_color_hex(0x62D9FF).full);
 
     auto* colors = reinterpret_cast<uint16_t*>(music_progress_image_data_.data());
     auto* alpha = music_progress_image_data_.data() + pixel_count * sizeof(uint16_t);
@@ -680,6 +866,15 @@ void EmoteDisplay::SetMusicLyrics(const char* title, const char* lyrics)
                                 : GFX_COLOR_HEX(0xFFFFFF));
         gfx_obj_set_visible(music_lyric_rows_[i], has_text);
     }
+    if (!music_playback_info_visible_) {
+        RenderMusicTimeImage("0:00/--:--");
+        gfx_img_set_src(music_time_, &music_time_image_);
+        gfx_obj_set_visible(music_time_, true);
+        for (auto* bar : music_rhythm_bars_) {
+            gfx_obj_set_visible(bar, true);
+        }
+        music_playback_info_visible_ = true;
+    }
     emote_unlock(emote_handle_);
 
 }
@@ -713,6 +908,51 @@ void EmoteDisplay::SetMusicProgress(int progress_permille)
     emote_unlock(emote_handle_);
 }
 
+void EmoteDisplay::SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
+                                        int level_0, int level_1, int level_2)
+{
+    if (!emote_handle_ || !EnsureMusicUi()) {
+        return;
+    }
+
+    const int levels[3] = {
+        std::clamp(level_0, 0, 1000),
+        std::clamp(level_1, 0, 1000),
+        std::clamp(level_2, 0, 1000),
+    };
+    const int bar_width = std::max(2, width_ * kMusicRhythmBarWidth / 360);
+    const int bar_bottom = height_ * kMusicRhythmBottomY / 360;
+
+    emote_lock(emote_handle_);
+    if (elapsed_seconds != music_elapsed_seconds_ || total_seconds != music_total_seconds_) {
+        const std::string time = FormatMusicPlaybackTime(elapsed_seconds, total_seconds);
+        RenderMusicTimeImage(time);
+        gfx_img_set_src(music_time_, &music_time_image_);
+        music_elapsed_seconds_ = elapsed_seconds;
+        music_total_seconds_ = total_seconds;
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        const int height = 1 + levels[i] * 9 / 1000;
+        if (height != music_rhythm_heights_[i]) {
+            const int left_x = width_ * kMusicRhythmLeftX[i] / 360;
+            const int right_x = width_ - left_x - bar_width;
+            gfx_obj_set_size(music_rhythm_bars_[i], bar_width, height);
+            gfx_obj_set_pos(music_rhythm_bars_[i], left_x, bar_bottom - height);
+            gfx_obj_set_size(music_rhythm_bars_[i + 3], bar_width, height);
+            gfx_obj_set_pos(music_rhythm_bars_[i + 3], right_x, bar_bottom - height);
+            music_rhythm_heights_[i] = height;
+        }
+    }
+    if (!music_playback_info_visible_) {
+        gfx_obj_set_visible(music_time_, true);
+        for (auto* bar : music_rhythm_bars_) {
+            gfx_obj_set_visible(bar, true);
+        }
+        music_playback_info_visible_ = true;
+    }
+    emote_unlock(emote_handle_);
+}
+
 void EmoteDisplay::ClearMusicLyrics()
 {
     if (!emote_handle_ || !music_background_) {
@@ -726,6 +966,15 @@ void EmoteDisplay::ClearMusicLyrics()
             gfx_obj_set_visible(row, false);
         }
     }
+    if (music_time_) {
+        gfx_obj_set_visible(music_time_, false);
+    }
+    for (auto* bar : music_rhythm_bars_) {
+        if (bar) {
+            gfx_obj_set_visible(bar, false);
+        }
+    }
+    music_playback_info_visible_ = false;
     if (music_progress_) {
         gfx_obj_set_visible(music_progress_, false);
         music_progress_visible_ = false;
