@@ -32,6 +32,16 @@ protected:
     std::unique_ptr<LvglGif> gif_controller_ = nullptr;
     lv_obj_t* emoji_box_ = nullptr;
     lv_obj_t* chat_message_label_ = nullptr;
+    lv_obj_t* music_overlay_ = nullptr;
+    lv_obj_t* music_title_ = nullptr;
+    lv_obj_t* music_lyrics_ = nullptr;
+    lv_obj_t* music_time_ = nullptr;
+    lv_obj_t* music_rhythm_bars_[6] = {};
+    lv_obj_t* music_progress_ = nullptr;
+    int music_elapsed_seconds_ = -1;
+    int music_total_seconds_ = -1;
+    int music_rhythm_heights_[3] = {};
+    bool music_playback_info_visible_ = false;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
@@ -49,6 +59,11 @@ public:
     virtual void SetEmotion(const char* emotion) override;
     virtual void SetChatMessage(const char* role, const char* content) override;
     virtual void ClearChatMessages() override;
+    virtual void SetMusicLyrics(const char* title, const char* lyrics) override;
+    virtual void SetMusicProgress(int progress_permille) override;
+    virtual void SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
+                                      int level_0, int level_1, int level_2) override;
+    virtual void ClearMusicLyrics() override;
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;
     virtual void SetupUI() override;
     // Add theme switching function

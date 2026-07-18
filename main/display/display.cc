@@ -49,6 +49,19 @@ void Display::ClearChatMessages() {
     // Default empty implementation, override in subclasses if needed
 }
 
+void Display::SetMusicLyrics(const char* title, const char* lyrics) {
+}
+
+void Display::SetMusicProgress(int progress_permille) {
+}
+
+void Display::SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
+                                   int level_0, int level_1, int level_2) {
+}
+
+void Display::ClearMusicLyrics() {
+}
+
 void Display::SetTheme(Theme* theme) {
     current_theme_ = theme;
     Settings settings("display", true);

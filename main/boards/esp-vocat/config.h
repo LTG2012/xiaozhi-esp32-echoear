@@ -17,6 +17,11 @@
 #define SD_SCK      GPIO_NUM_16
 #define SD_MOSI     GPIO_NUM_38
 
+// 1-bit SDMMC wiring from the ESP-VoCat schematic.
+#define SD_CARD_CLK_GPIO  GPIO_NUM_16
+#define SD_CARD_CMD_GPIO  GPIO_NUM_38
+#define SD_CARD_D0_GPIO   GPIO_NUM_17
+
 #define AUDIO_I2S_GPIO_MCLK     GPIO_NUM_42
 #define AUDIO_I2S_GPIO_WS       GPIO_NUM_39
 #define AUDIO_I2S_GPIO_BCLK     GPIO_NUM_40

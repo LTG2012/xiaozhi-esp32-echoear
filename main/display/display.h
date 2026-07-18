@@ -36,6 +36,11 @@ public:
     virtual void SetEmotion(const char* emotion);
     virtual void SetChatMessage(const char* role, const char* content);
     virtual void ClearChatMessages();
+    virtual void SetMusicLyrics(const char* title, const char* lyrics);
+    virtual void SetMusicProgress(int progress_permille);
+    virtual void SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
+                                      int level_0, int level_1, int level_2);
+    virtual void ClearMusicLyrics();
     virtual void SetTheme(Theme* theme);
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);
