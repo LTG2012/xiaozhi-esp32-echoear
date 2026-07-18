@@ -2,6 +2,7 @@
 
 #include "display.h"
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <esp_lcd_panel_io.h>
@@ -36,6 +37,7 @@ public:
 
     bool StopAnimDialog();
     bool InsertAnimDialog(const char* emoji_name, uint32_t duration_ms);
+    std::string RefreshCustomWallpapers();
 
     void RefreshAll();
 
@@ -81,6 +83,9 @@ private:
     gfx_font_t wallpaper_font_ = nullptr;
     bool wallpaper_font_owned_ = false;
     gfx_image_dsc_t wallpaper_image_dsc_ = {};
+    std::mutex wallpaper_data_mutex_;
+    std::vector<std::string> custom_wallpaper_paths_;
+    std::vector<uint8_t> custom_wallpaper_pixels_;
     esp_timer_handle_t wallpaper_timer_ = nullptr;
     bool wallpaper_idle_ = false;
     bool wallpaper_music_active_ = false;
@@ -105,6 +110,10 @@ private:
     static void WallpaperTimerCallback(void* arg);
     bool EnsureWallpaperUi();
     bool LoadWallpaperAsset(int index);
+    bool LoadCustomWallpaper(int index);
+    bool LoadWallpaper(int index);
+    size_t WallpaperCount();
+    bool ScanCustomWallpapers(std::string& result);
     void SetWallpaperNativeUiVisible(bool visible);
     void ShowWallpaper();
     void HideWallpaper();

@@ -8,6 +8,7 @@
 #include "config.h"
 #include "backlight.h"
 #include "esp_video.h"
+#include "sd_card_manager.h"
 #include "sd_music_player.h"
 
 #include <esp_log.h>
@@ -989,8 +990,8 @@ private:
                 return std::string("Wallpaper city saved: ") + city;
             });
 
-        server.AddTool(
-            "self.wallpaper.update_weather",
+          server.AddTool(
+              "self.wallpaper.update_weather",
             "After the weather service has returned a result, update the cached Emote wallpaper weather. "
             "Do not call a weather service from the device; pass the service result to this tool.",
             PropertyList({Property("city", kPropertyTypeString),
@@ -1012,9 +1013,21 @@ private:
                                              properties["temperature_c"].value<int>(),
                                              properties["high_c"].value<int>(),
                                              properties["low_c"].value<int>());
-                return std::string("Wallpaper weather updated: ") + city + " " + condition;
-            });
-    }
+                  return std::string("Wallpaper weather updated: ") + city + " " + condition;
+              });
+
+          server.AddTool(
+              "self.wallpaper.refresh",
+              "Rescan /wallpapers on the SD card for JPEG custom wallpapers. Call this when the user asks to refresh or reload wallpaper files.",
+              PropertyList(),
+              [this](const PropertyList&) -> ReturnValue {
+                  auto* display = dynamic_cast<emote::EmoteDisplay*>(display_);
+                  if (!display) {
+                      return std::string("Wallpaper desktop is only available in the Emote firmware.");
+                  }
+                  return display->RefreshCustomWallpapers();
+              });
+      }
 
     void HandleTouchRelease()
     {
@@ -1281,9 +1294,19 @@ public:
         InitializeSt77916Display(pcb_version);
         InitializeButtons();
         InitializeCapacitiveTouchPads();
+        SdCardManager::GetInstance().Initialize({
+            .mount_point = "/sdcard",
+            .clk = SD_CARD_CLK_GPIO,
+            .cmd = SD_CARD_CMD_GPIO,
+            .d0 = SD_CARD_D0_GPIO,
+            .max_files = 6,
+        });
         music_player_ = std::make_unique<SdMusicPlayer>();
         music_player_->RegisterMcpTools();
         RegisterWallpaperMcpTools();
+        if (auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display_)) {
+            emote_display->RefreshCustomWallpapers();
+        }
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
         InitializeCamera();
 #endif // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE

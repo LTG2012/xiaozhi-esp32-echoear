@@ -3,6 +3,8 @@
 // Standard C++ headers
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
+#include <dirent.h>
 #include <memory>
 #include <array>
 #include <string>
@@ -16,10 +18,12 @@
 // Standard C headers
 #include <sys/time.h>
 #include <time.h>
+#include <sys/stat.h>
 
 // ESP-IDF headers
 #include <esp_log.h>
 #include <esp_lcd_panel_io.h>
+#include <esp_jpeg_common.h>
 #include <esp_timer.h>
 #include <lvgl.h>
 
@@ -34,6 +38,8 @@
 #include "gfx.h"
 #include "expression_emote.h"
 #include "settings.h"
+#include "boards/common/sd_card_manager.h"
+#include "jpeg_to_image.h"
 
 extern "C" {
 LV_FONT_DECLARE(font_puhui_basic_20_4);
@@ -73,6 +79,80 @@ static constexpr std::array<const char*, 3> kWallpaperAssets = {
     "wallpaper_day.bin",
     "wallpaper_night.bin",
 };
+static constexpr char kWallpaperDirectory[] = "/wallpapers";
+static constexpr size_t kMaxCustomWallpapers = 64;
+static constexpr off_t kMaxCustomWallpaperBytes = 2 * 1024 * 1024;
+static constexpr uint16_t kMaxCustomWallpaperDimension = 1024;
+
+static bool HasJpegExtension(const char* name)
+{
+    if (name == nullptr) {
+        return false;
+    }
+    const std::string filename(name);
+    const size_t dot = filename.find_last_of('.');
+    if (dot == std::string::npos) {
+        return false;
+    }
+    std::string extension = filename.substr(dot);
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return extension == ".jpg" || extension == ".jpeg";
+}
+
+static bool ReadJpegDimensions(FILE* file, uint16_t& width, uint16_t& height)
+{
+    width = 0;
+    height = 0;
+    if (file == nullptr || std::fgetc(file) != 0xFF || std::fgetc(file) != 0xD8) {
+        return false;
+    }
+    while (true) {
+        int marker_prefix = std::fgetc(file);
+        while (marker_prefix == 0xFF) {
+            marker_prefix = std::fgetc(file);
+        }
+        if (marker_prefix == EOF || marker_prefix == 0xD9 || marker_prefix == 0xDA) {
+            return false;
+        }
+        const int marker = marker_prefix;
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+            continue;
+        }
+        const int length_hi = std::fgetc(file);
+        const int length_lo = std::fgetc(file);
+        if (length_hi == EOF || length_lo == EOF) {
+            return false;
+        }
+        const int segment_length = (length_hi << 8) | length_lo;
+        if (segment_length < 2) {
+            return false;
+        }
+        const bool is_sof = (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 &&
+                             marker != 0xC8 && marker != 0xCC);
+        if (is_sof) {
+            if (segment_length < 8) {
+                return false;
+            }
+            if (std::fgetc(file) == EOF) {
+                return false;
+            }
+            const int height_hi = std::fgetc(file);
+            const int height_lo = std::fgetc(file);
+            const int width_hi = std::fgetc(file);
+            const int width_lo = std::fgetc(file);
+            if (height_hi == EOF || height_lo == EOF || width_hi == EOF || width_lo == EOF) {
+                return false;
+            }
+            height = static_cast<uint16_t>((height_hi << 8) | height_lo);
+            width = static_cast<uint16_t>((width_hi << 8) | width_lo);
+            return width > 0 && height > 0;
+        }
+        if (std::fseek(file, segment_length - 2, SEEK_CUR) != 0) {
+            return false;
+        }
+    }
+}
 
 static bool ParseAssistantWeather(const char* content, std::string& city,
                                   std::string& condition, int& temperature_c)
@@ -1217,6 +1297,198 @@ bool EmoteDisplay::LoadWallpaperAsset(int index)
         wallpaper_image_dsc_.header.w == width_ && wallpaper_image_dsc_.header.h == height_;
 }
 
+size_t EmoteDisplay::WallpaperCount()
+{
+    std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+    return custom_wallpaper_paths_.empty() ? kWallpaperAssets.size() : custom_wallpaper_paths_.size();
+}
+
+bool EmoteDisplay::ScanCustomWallpapers(std::string& result)
+{
+    auto& sd_card = SdCardManager::GetInstance();
+    const std::string mount_error = sd_card.EnsureMounted();
+    if (!mount_error.empty()) {
+        result = mount_error;
+        return false;
+    }
+
+    std::vector<std::string> paths;
+    const std::string directory = std::string(sd_card.MountPoint()) + kWallpaperDirectory;
+    std::lock_guard<std::mutex> filesystem_lock(sd_card.FilesystemMutex());
+    if (mkdir(directory.c_str(), 0775) != 0 && errno != EEXIST) {
+        result = "Unable to create /wallpapers on the SD card.";
+        ESP_LOGW(TAG, "%s: %s", result.c_str(), strerror(errno));
+        return false;
+    }
+
+    DIR* folder = opendir(directory.c_str());
+    if (folder == nullptr) {
+        result = "Unable to open /wallpapers on the SD card.";
+        ESP_LOGW(TAG, "%s: %s", result.c_str(), strerror(errno));
+        return false;
+    }
+    while (paths.size() < kMaxCustomWallpapers) {
+        dirent* entry = readdir(folder);
+        if (entry == nullptr) {
+            break;
+        }
+        if (!HasJpegExtension(entry->d_name)) {
+            continue;
+        }
+        const std::string path = directory + "/" + entry->d_name;
+        struct stat info = {};
+        if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_size <= 0 ||
+            info.st_size > kMaxCustomWallpaperBytes) {
+            ESP_LOGW(TAG, "Skipping custom wallpaper %s: invalid size", entry->d_name);
+            continue;
+        }
+        FILE* file = std::fopen(path.c_str(), "rb");
+        uint16_t image_width = 0;
+        uint16_t image_height = 0;
+        const bool valid = file != nullptr && ReadJpegDimensions(file, image_width, image_height);
+        if (file != nullptr) {
+            std::fclose(file);
+        }
+        if (!valid || image_width > kMaxCustomWallpaperDimension ||
+            image_height > kMaxCustomWallpaperDimension) {
+            ESP_LOGW(TAG, "Skipping custom wallpaper %s: invalid JPEG dimensions", entry->d_name);
+            continue;
+        }
+        paths.push_back(path);
+    }
+    closedir(folder);
+
+    std::sort(paths.begin(), paths.end());
+    {
+        std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+        custom_wallpaper_paths_ = std::move(paths);
+        custom_wallpaper_pixels_.clear();
+    }
+    result = "Custom wallpaper scan found " + std::to_string(WallpaperCount()) + " JPEG file(s).";
+    return true;
+}
+
+std::string EmoteDisplay::RefreshCustomWallpapers()
+{
+    HideWallpaper();
+    std::string result;
+    if (!ScanCustomWallpapers(result)) {
+        std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+        custom_wallpaper_paths_.clear();
+        custom_wallpaper_pixels_.clear();
+    }
+    wallpaper_index_ = 0;
+    wallpaper_shown_since_us_ = 0;
+    ESP_LOGI(TAG, "%s", result.c_str());
+    return result;
+}
+
+bool EmoteDisplay::LoadCustomWallpaper(int index)
+{
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+        if (index < 0 || index >= static_cast<int>(custom_wallpaper_paths_.size())) {
+            return false;
+        }
+        path = custom_wallpaper_paths_[index];
+    }
+
+    auto& sd_card = SdCardManager::GetInstance();
+    if (!sd_card.EnsureMounted().empty()) {
+        return false;
+    }
+    std::vector<uint8_t> jpeg;
+    {
+        std::lock_guard<std::mutex> filesystem_lock(sd_card.FilesystemMutex());
+        struct stat info = {};
+        if (stat(path.c_str(), &info) != 0 || info.st_size <= 0 ||
+            info.st_size > kMaxCustomWallpaperBytes) {
+            return false;
+        }
+        FILE* file = std::fopen(path.c_str(), "rb");
+        if (file == nullptr) {
+            return false;
+        }
+        jpeg.resize(static_cast<size_t>(info.st_size));
+        const size_t read = std::fread(jpeg.data(), 1, jpeg.size(), file);
+        std::fclose(file);
+        if (read != jpeg.size()) {
+            return false;
+        }
+    }
+
+    uint8_t* decoded = nullptr;
+    size_t decoded_size = 0;
+    size_t source_width = 0;
+    size_t source_height = 0;
+    size_t source_stride = 0;
+    if (jpeg_to_image(jpeg.data(), jpeg.size(), &decoded, &decoded_size, &source_width,
+                      &source_height, &source_stride) != ESP_OK || decoded == nullptr ||
+        source_width == 0 || source_height == 0 || source_width > kMaxCustomWallpaperDimension ||
+        source_height > kMaxCustomWallpaperDimension ||
+        source_stride < source_width * sizeof(uint16_t) ||
+        decoded_size < source_stride * source_height) {
+        if (decoded != nullptr) {
+            jpeg_free_align(decoded);
+        }
+        return false;
+    }
+
+    const float scale = std::max(static_cast<float>(width_) / source_width,
+                                 static_cast<float>(height_) / source_height);
+    const float crop_width = static_cast<float>(width_) / scale;
+    const float crop_height = static_cast<float>(height_) / scale;
+    const float crop_x = (static_cast<float>(source_width) - crop_width) / 2.0f;
+    const float crop_y = (static_cast<float>(source_height) - crop_height) / 2.0f;
+    std::vector<uint8_t> pixels(static_cast<size_t>(width_) * height_ * sizeof(uint16_t));
+    for (int y = 0; y < height_; ++y) {
+        const size_t source_y = std::min(source_height - 1, static_cast<size_t>(
+            std::max(0.0f, crop_y + (static_cast<float>(y) + 0.5f) / scale)));
+        for (int x = 0; x < width_; ++x) {
+            const size_t source_x = std::min(source_width - 1, static_cast<size_t>(
+                std::max(0.0f, crop_x + (static_cast<float>(x) + 0.5f) / scale)));
+            const size_t source_offset = source_y * source_stride + source_x * sizeof(uint16_t);
+            const size_t target_offset = (static_cast<size_t>(y) * width_ + x) * sizeof(uint16_t);
+            pixels[target_offset] = decoded[source_offset + 1];
+            pixels[target_offset + 1] = decoded[source_offset];
+        }
+    }
+    jpeg_free_align(decoded);
+
+    std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+    custom_wallpaper_pixels_ = std::move(pixels);
+    wallpaper_image_dsc_.header.magic = C_ARRAY_HEADER_MAGIC;
+    wallpaper_image_dsc_.header.cf = GFX_COLOR_FORMAT_RGB565;
+    wallpaper_image_dsc_.header.flags = 0;
+    wallpaper_image_dsc_.header.w = width_;
+    wallpaper_image_dsc_.header.h = height_;
+    wallpaper_image_dsc_.header.stride = width_ * sizeof(uint16_t);
+    wallpaper_image_dsc_.header.reserved = 0;
+    wallpaper_image_dsc_.data_size = custom_wallpaper_pixels_.size();
+    wallpaper_image_dsc_.data = custom_wallpaper_pixels_.data();
+    wallpaper_image_dsc_.reserved = nullptr;
+    wallpaper_image_dsc_.reserved_2 = nullptr;
+    return true;
+}
+
+bool EmoteDisplay::LoadWallpaper(int index)
+{
+    bool has_custom_wallpapers = false;
+    {
+        std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+        has_custom_wallpapers = !custom_wallpaper_paths_.empty();
+    }
+    if (!has_custom_wallpapers) {
+        return LoadWallpaperAsset(index);
+    }
+    if (LoadCustomWallpaper(index)) {
+        return true;
+    }
+    ESP_LOGW(TAG, "Custom wallpaper %d failed; using an internal wallpaper", index);
+    return LoadWallpaperAsset(index % kWallpaperAssets.size());
+}
+
 void EmoteDisplay::SetWallpaperNativeUiVisible(bool visible)
 {
     if (!emote_handle_) {
@@ -1242,7 +1514,7 @@ void EmoteDisplay::SetWallpaperNativeUiVisible(bool visible)
 
 void EmoteDisplay::ShowWallpaper()
 {
-    if (!EnsureWallpaperUi() || !LoadWallpaperAsset(wallpaper_index_)) {
+    if (!EnsureWallpaperUi() || !LoadWallpaper(wallpaper_index_)) {
         wallpaper_suppressed_until_us_ = esp_timer_get_time() + kWallpaperIdleDelayUs;
         return;
     }
@@ -1307,8 +1579,12 @@ void EmoteDisplay::TickWallpaper()
         wallpaper_fade_until_us_ = 0;
     }
     if (now_us - wallpaper_shown_since_us_ >= kWallpaperRotateUs) {
-        wallpaper_index_ = (wallpaper_index_ + 1) % kWallpaperAssets.size();
-        if (LoadWallpaperAsset(wallpaper_index_)) {
+        const size_t wallpaper_count = WallpaperCount();
+        if (wallpaper_count == 0) {
+            return;
+        }
+        wallpaper_index_ = (wallpaper_index_ + 1) % wallpaper_count;
+        if (LoadWallpaper(wallpaper_index_)) {
             emote_lock(emote_handle_);
             gfx_label_set_opa(wallpaper_fade_, 115);
             gfx_obj_set_visible(wallpaper_fade_, true);
