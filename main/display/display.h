@@ -41,6 +41,9 @@ public:
     virtual void SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
                                       int level_0, int level_1, int level_2);
     virtual void ClearMusicLyrics();
+    virtual void SetWallpaperLocation(const char* city);
+    virtual void SetWallpaperWeather(const char* city, const char* condition,
+                                     int temperature_c, int high_c, int low_c);
     virtual void SetTheme(Theme* theme);
     virtual Theme* GetTheme() { return current_theme_; }
     virtual void UpdateStatusBar(bool update_all = false);

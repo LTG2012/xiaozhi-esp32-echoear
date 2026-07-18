@@ -3,6 +3,7 @@
 #include "display/lcd_display.h"
 #include "display/emote_display.h"
 #include "application.h"
+#include "mcp_server.h"
 #include "button.h"
 #include "config.h"
 #include "backlight.h"
@@ -967,6 +968,54 @@ private:
         }
     }
 
+    void RegisterWallpaperMcpTools()
+    {
+        auto& server = McpServer::GetInstance();
+        server.AddTool(
+            "self.wallpaper.set_location",
+            "Save the city explicitly provided by the user for the Emote idle wallpaper. "
+            "Call this when the user states where they are or asks to set the wallpaper city.",
+            PropertyList({Property("city", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                auto* display = dynamic_cast<emote::EmoteDisplay*>(display_);
+                if (!display) {
+                    return std::string("Wallpaper desktop is only available in the Emote firmware.");
+                }
+                const std::string city = properties["city"].value<std::string>();
+                if (city.empty()) {
+                    return std::string("City is required.");
+                }
+                display->SetWallpaperLocation(city.c_str());
+                return std::string("Wallpaper city saved: ") + city;
+            });
+
+        server.AddTool(
+            "self.wallpaper.update_weather",
+            "After the weather service has returned a result, update the cached Emote wallpaper weather. "
+            "Do not call a weather service from the device; pass the service result to this tool.",
+            PropertyList({Property("city", kPropertyTypeString),
+                          Property("condition", kPropertyTypeString),
+                          Property("temperature_c", kPropertyTypeInteger, -100, 100),
+                          Property("high_c", kPropertyTypeInteger, -1000),
+                          Property("low_c", kPropertyTypeInteger, -1000)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                auto* display = dynamic_cast<emote::EmoteDisplay*>(display_);
+                if (!display) {
+                    return std::string("Wallpaper desktop is only available in the Emote firmware.");
+                }
+                const std::string city = properties["city"].value<std::string>();
+                const std::string condition = properties["condition"].value<std::string>();
+                if (city.empty() || condition.empty()) {
+                    return std::string("City and condition are required.");
+                }
+                display->SetWallpaperWeather(city.c_str(), condition.c_str(),
+                                             properties["temperature_c"].value<int>(),
+                                             properties["high_c"].value<int>(),
+                                             properties["low_c"].value<int>());
+                return std::string("Wallpaper weather updated: ") + city + " " + condition;
+            });
+    }
+
     void HandleTouchRelease()
     {
         constexpr int64_t kTransitionWindowUs = 450 * 1000;
@@ -1234,6 +1283,7 @@ public:
         InitializeCapacitiveTouchPads();
         music_player_ = std::make_unique<SdMusicPlayer>();
         music_player_->RegisterMcpTools();
+        RegisterWallpaperMcpTools();
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
         InitializeCamera();
 #endif // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE

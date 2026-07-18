@@ -1133,6 +1133,10 @@ if(CONFIG_BOARD_TYPE_ESP_VOCAT)
              DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/emoji_large")
         file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/emoji/battery_connected.eaf"
              DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/emoji_large")
+        file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/assets/wallpapers/wallpaper_dawn.bin"
+             "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/assets/wallpapers/wallpaper_day.bin"
+             "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/assets/wallpapers/wallpaper_night.bin"
+             DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/emoji_large")
         file(COPY "${ESP_SR_COMPONENT_PATH}/model/wakenet_model/wn9_nihaoxiaozhi_tts"
              "${ESP_SR_COMPONENT_PATH}/model/wakenet_model/wn9_nihaomiaoban_tts2"
              DESTINATION "${ESP_VOCAT_ASSETS_STAGING}/wakenet_models")
@@ -1149,6 +1153,9 @@ if(CONFIG_BOARD_TYPE_ESP_VOCAT)
             "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/assets/360_360/emote.json"
             "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/emoji/low_battery.eaf"
             "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/emoji/battery_connected.eaf"
+            "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/assets/wallpapers/wallpaper_dawn.bin"
+            "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/assets/wallpapers/wallpaper_day.bin"
+            "${CMAKE_CURRENT_SOURCE_DIR}/boards/esp-vocat/assets/wallpapers/wallpaper_night.bin"
             "${ESP_SR_COMPONENT_PATH}/model/wakenet_model/wn9_nihaoxiaozhi_tts/_MODEL_INFO_"
             "${ESP_SR_COMPONENT_PATH}/model/wakenet_model/wn9_nihaomiaoban_tts2/_MODEL_INFO_"
         )

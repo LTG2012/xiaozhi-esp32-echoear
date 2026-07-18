@@ -25,6 +25,9 @@ public:
     virtual void SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
                                       int level_0, int level_1, int level_2) override;
     virtual void ClearMusicLyrics() override;
+    virtual void SetWallpaperLocation(const char* city) override;
+    virtual void SetWallpaperWeather(const char* city, const char* condition,
+                                     int temperature_c, int high_c, int low_c) override;
     virtual void SetTheme(Theme* theme) override;
     virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
     virtual void UpdateStatusBar(bool update_all = false) override;
@@ -41,6 +44,7 @@ public:
 
 private:
     static constexpr size_t kMusicLyricRowCount = 7;
+    static constexpr int kWallpaperUnsetTemperature = -1000;
 
     virtual bool Lock(int timeout_ms = 0) override;
     virtual void Unlock() override;
@@ -69,10 +73,46 @@ private:
     int music_total_seconds_ = -1;
     int music_rhythm_heights_[3] = {};
 
+    gfx_obj_t* wallpaper_image_ = nullptr;
+    gfx_obj_t* wallpaper_fade_ = nullptr;
+    gfx_obj_t* wallpaper_date_ = nullptr;
+    gfx_obj_t* wallpaper_time_ = nullptr;
+    gfx_obj_t* wallpaper_weather_ = nullptr;
+    gfx_font_t wallpaper_font_ = nullptr;
+    bool wallpaper_font_owned_ = false;
+    gfx_image_dsc_t wallpaper_image_dsc_ = {};
+    esp_timer_handle_t wallpaper_timer_ = nullptr;
+    bool wallpaper_idle_ = false;
+    bool wallpaper_music_active_ = false;
+    bool wallpaper_visible_ = false;
+    int wallpaper_index_ = 0;
+    int wallpaper_last_minute_ = -1;
+    int64_t wallpaper_idle_since_us_ = 0;
+    int64_t wallpaper_shown_since_us_ = 0;
+    int64_t wallpaper_fade_until_us_ = 0;
+    int64_t wallpaper_suppressed_until_us_ = 0;
+    std::string wallpaper_city_;
+    std::string wallpaper_condition_;
+    int wallpaper_temperature_c_ = kWallpaperUnsetTemperature;
+    int wallpaper_high_c_ = kWallpaperUnsetTemperature;
+    int wallpaper_low_c_ = kWallpaperUnsetTemperature;
+
     bool EnsureMusicUi();
     bool InitializeMusicTimeImage();
     void RenderMusicTimeImage(const std::string& text);
     bool InitializeMusicProgressImage();
+
+    static void WallpaperTimerCallback(void* arg);
+    bool EnsureWallpaperUi();
+    bool LoadWallpaperAsset(int index);
+    void SetWallpaperNativeUiVisible(bool visible);
+    void ShowWallpaper();
+    void HideWallpaper();
+    void TickWallpaper();
+    void UpdateWallpaperText(bool force = false);
+    void CacheWeatherFromAssistantMessage(const char* content);
+    void LoadWallpaperSettings();
+    void SaveWallpaperSettings();
 
 };
 
