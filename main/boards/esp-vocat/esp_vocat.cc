@@ -1326,6 +1326,8 @@ public:
             emote_display->RefreshCustomWallpapers();
             media_transfer_ = std::make_unique<MediaTransferServer>(
                 [emote_display]() { emote_display->RequestCustomWallpaperRefresh(); },
+                [this]() { music_player_->RequestLibraryRefresh(); },
+                [this]() { return music_player_->IsActive(); },
                 [emote_display](const std::string& url) { emote_display->ShowMediaTransferQr(url.c_str()); },
                 [emote_display](const std::string&) { emote_display->HideMediaTransferQr(); });
             RegisterMediaTransferMcpTools();

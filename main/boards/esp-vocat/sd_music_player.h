@@ -15,6 +15,8 @@ public:
     ~SdMusicPlayer();
 
     void RegisterMcpTools();
+    bool IsActive() const;
+    void RequestLibraryRefresh();
 
 private:
     struct Song {
@@ -44,7 +46,7 @@ private:
     static constexpr uint32_t kOutputSampleRate = 24000;
     static constexpr size_t kPcmChunkSamples = 960;
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::vector<Song> songs_;
     bool scanned_ = false;
     State state_ = State::kStopped;

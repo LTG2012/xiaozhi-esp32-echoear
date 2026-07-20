@@ -225,6 +225,24 @@ SdMusicPlayer::~SdMusicPlayer() {
     ClearQueuedMusic();
 }
 
+bool SdMusicPlayer::IsActive() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return state_ != State::kStopped;
+}
+
+void SdMusicPlayer::RequestLibraryRefresh() {
+    Application::GetInstance().Schedule([this]() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::kStopped) {
+                return;
+            }
+            scanned_ = false;
+        }
+        (void)EnsureLibrary();
+    });
+}
+
 void SdMusicPlayer::RegisterMcpTools() {
     auto& server = McpServer::GetInstance();
     server.AddTool(

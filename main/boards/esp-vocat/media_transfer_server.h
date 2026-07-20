@@ -10,10 +10,11 @@
 class MediaTransferServer {
 public:
     using RefreshCallback = std::function<void()>;
+    using BusyCallback = std::function<bool()>;
     using DisplayCallback = std::function<void(const std::string&)>;
 
-    MediaTransferServer(RefreshCallback refresh_wallpapers, DisplayCallback show_qr,
-                        DisplayCallback hide_qr);
+    MediaTransferServer(RefreshCallback refresh_wallpapers, RefreshCallback refresh_music,
+                        BusyCallback music_active, DisplayCallback show_qr, DisplayCallback hide_qr);
     ~MediaTransferServer();
 
     std::string Start();
@@ -27,16 +28,22 @@ private:
     static esp_err_t DeleteHandler(httpd_req_t* req);
     static esp_err_t RenameHandler(httpd_req_t* req);
 
+    enum class FileType { kWallpaper, kMusic };
+
+    bool ParseFileType(httpd_req_t* req, FileType& type) const;
     bool IsValidName(const std::string& name) const;
-    bool IsWallpaperFile(const std::string& name) const;
-    std::string WallpaperDirectory() const;
+    bool IsSupportedFile(const std::string& name, FileType type) const;
+    size_t MaxFileSize(FileType type, const std::string& name) const;
+    std::string Directory(FileType type) const;
     std::string ReadQuery(httpd_req_t* req, const char* key) const;
     void SendJson(httpd_req_t* req, int status, const std::string& body) const;
     void SendError(httpd_req_t* req, int status, const char* message) const;
-    std::string ListWallpapers() const;
+    std::string ListFiles(FileType type) const;
     void StopLocked();
 
     RefreshCallback refresh_wallpapers_;
+    RefreshCallback refresh_music_;
+    BusyCallback music_active_;
     DisplayCallback show_qr_;
     DisplayCallback hide_qr_;
     mutable std::mutex mutex_;
