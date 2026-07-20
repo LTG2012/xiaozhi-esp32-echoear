@@ -3,11 +3,14 @@
 #include "display/lcd_display.h"
 #include "display/emote_display.h"
 #include "application.h"
+#include "mcp_server.h"
 #include "button.h"
 #include "config.h"
 #include "backlight.h"
 #include "esp_video.h"
+#include "sd_card_manager.h"
 #include "sd_music_player.h"
+#include "media_transfer_server.h"
 
 #include <esp_log.h>
 #include <esp_err.h>
@@ -755,6 +758,7 @@ private:
     int64_t touch_release_time_us_ = 0;
     bool touch_swipe_detected_ = false;
     std::unique_ptr<SdMusicPlayer> music_player_;
+    std::unique_ptr<MediaTransferServer> media_transfer_;
 
     static void emotion_reset_timer_callback(void* arg)
     {
@@ -1168,6 +1172,81 @@ private:
         }
     }
 
+    void RegisterWallpaperMcpTools()
+    {
+        auto& server = McpServer::GetInstance();
+        server.AddTool(
+            "self.wallpaper.set_location",
+            "Save the city explicitly provided by the user for the Emote idle wallpaper. "
+            "Call this when the user states where they are or asks to set the wallpaper city.",
+            PropertyList({Property("city", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                auto* display = dynamic_cast<emote::EmoteDisplay*>(display_);
+                if (!display) {
+                    return std::string("Wallpaper desktop is only available in the Emote firmware.");
+                }
+                const std::string city = properties["city"].value<std::string>();
+                if (city.empty()) {
+                    return std::string("City is required.");
+                }
+                display->SetWallpaperLocation(city.c_str());
+                return std::string("Wallpaper city saved: ") + city;
+            });
+
+          server.AddTool(
+              "self.wallpaper.update_weather",
+            "After the weather service has returned a result, update the cached Emote wallpaper weather. "
+            "Do not call a weather service from the device; pass the service result to this tool.",
+            PropertyList({Property("city", kPropertyTypeString),
+                          Property("condition", kPropertyTypeString),
+                          Property("temperature_c", kPropertyTypeInteger, -100, 100),
+                          Property("high_c", kPropertyTypeInteger, -1000),
+                          Property("low_c", kPropertyTypeInteger, -1000)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                auto* display = dynamic_cast<emote::EmoteDisplay*>(display_);
+                if (!display) {
+                    return std::string("Wallpaper desktop is only available in the Emote firmware.");
+                }
+                const std::string city = properties["city"].value<std::string>();
+                const std::string condition = properties["condition"].value<std::string>();
+                if (city.empty() || condition.empty()) {
+                    return std::string("City and condition are required.");
+                }
+                display->SetWallpaperWeather(city.c_str(), condition.c_str(),
+                                             properties["temperature_c"].value<int>(),
+                                             properties["high_c"].value<int>(),
+                                             properties["low_c"].value<int>());
+                  return std::string("Wallpaper weather updated: ") + city + " " + condition;
+              });
+
+          server.AddTool(
+              "self.wallpaper.refresh",
+              "Rescan /wallpapers on the SD card for JPEG custom wallpapers. Call this when the user asks to refresh or reload wallpaper files.",
+              PropertyList(),
+              [this](const PropertyList&) -> ReturnValue {
+                  auto* display = dynamic_cast<emote::EmoteDisplay*>(display_);
+                  if (!display) {
+                      return std::string("Wallpaper desktop is only available in the Emote firmware.");
+                  }
+                  return display->RefreshCustomWallpapers();
+              });
+      }
+
+    void RegisterMediaTransferMcpTools()
+    {
+        auto& server = McpServer::GetInstance();
+        server.AddTool(
+            "self.media_transfer.start",
+            "Open the Emote device's local Wi-Fi wallpaper management page for 10 minutes. Call when the user asks to upload or manage SD-card wallpapers. The device displays the QR code and IP address for a phone or computer browser.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue { return media_transfer_->Start(); });
+        server.AddTool(
+            "self.media_transfer.stop", "Close the local Wi-Fi media transfer page.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue { return media_transfer_->Stop(); });
+        server.AddTool(
+            "self.media_transfer.status", "Get the local Wi-Fi media transfer status.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue { return media_transfer_->Status(); });
+    }
+
     void HandleTouchRelease()
     {
         constexpr int64_t kTransitionWindowUs = 450 * 1000;
@@ -1366,6 +1445,7 @@ private:
 
 public:
     ~EspVocat() {
+        media_transfer_.reset();
         // Music owns a worker that may update the display, so stop it before deleting display objects.
         music_player_.reset();
 
@@ -1433,8 +1513,26 @@ public:
         InitializeSt77916Display(pcb_version);
         InitializeButtons();
         InitializeCapacitiveTouchPads();
+        SdCardManager::GetInstance().Initialize({
+            .mount_point = "/sdcard",
+            .clk = SD_CARD_CLK_GPIO,
+            .cmd = SD_CARD_CMD_GPIO,
+            .d0 = SD_CARD_D0_GPIO,
+            .max_files = 6,
+        });
         music_player_ = std::make_unique<SdMusicPlayer>();
         music_player_->RegisterMcpTools();
+        RegisterWallpaperMcpTools();
+        if (auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display_)) {
+            emote_display->RefreshCustomWallpapers();
+            media_transfer_ = std::make_unique<MediaTransferServer>(
+                [emote_display]() { emote_display->RequestCustomWallpaperRefresh(); },
+                [this]() { music_player_->RequestLibraryRefresh(); },
+                [this]() { return music_player_->IsActive(); },
+                [emote_display](const std::string& url) { emote_display->ShowMediaTransferQr(url.c_str()); },
+                [emote_display](const std::string&) { emote_display->HideMediaTransferQr(); });
+            RegisterMediaTransferMcpTools();
+        }
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
         InitializeCamera();
 #endif // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE

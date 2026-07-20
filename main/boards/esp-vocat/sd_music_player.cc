@@ -3,9 +3,9 @@
 #include "application.h"
 #include "audio_service.h"
 #include "board.h"
-#include "config.h"
 #include "display.h"
 #include "mcp_server.h"
+#include "sd_card_manager.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -17,19 +17,16 @@
 #include <sstream>
 #include <sys/stat.h>
 
-#include <driver/sdmmc_host.h>
 #include <esp_ae_rate_cvt.h>
 #include <esp_audio_simple_dec.h>
 #include <esp_log.h>
 #include <esp_mp3_dec.h>
 #include <esp_random.h>
-#include <esp_vfs_fat.h>
 #include <ff.h>
 
 namespace {
 
 constexpr char kTag[] = "SdMusicPlayer";
-constexpr char kMountPoint[] = "/sdcard";
 constexpr size_t kMaxLrcFileSize = 512 * 1024;
 constexpr size_t kLyricsCharsPerVisualRow = 15;
 constexpr int kLyricsMaxVisualRows = 7;
@@ -226,12 +223,24 @@ SdMusicPlayer::~SdMusicPlayer() {
         }
     }
     ClearQueuedMusic();
-    std::lock_guard<std::mutex> filesystem_lock(filesystem_mutex_);
-    if (mounted_) {
-        esp_vfs_fat_sdcard_unmount(kMountPoint, card_);
-        mounted_ = false;
-        card_ = nullptr;
-    }
+}
+
+bool SdMusicPlayer::IsActive() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return state_ != State::kStopped;
+}
+
+void SdMusicPlayer::RequestLibraryRefresh() {
+    Application::GetInstance().Schedule([this]() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ != State::kStopped) {
+                return;
+            }
+            scanned_ = false;
+        }
+        (void)EnsureLibrary();
+    });
 }
 
 void SdMusicPlayer::RegisterMcpTools() {
@@ -273,7 +282,7 @@ void SdMusicPlayer::RegisterMcpTools() {
             const std::string library_error = EnsureLibrary();
             cJSON* result = cJSON_CreateObject();
             std::lock_guard<std::mutex> lock(mutex_);
-            cJSON_AddBoolToObject(result, "mounted", mounted_);
+            cJSON_AddBoolToObject(result, "mounted", SdCardManager::GetInstance().IsMounted());
             cJSON_AddStringToObject(result, "error", library_error.c_str());
             const char* state = "stopped";
             if (state_ == State::kPaused) {
@@ -690,24 +699,28 @@ bool SdMusicPlayer::IsCurrentGeneration(uint32_t generation) {
 }
 
 std::string SdMusicPlayer::EnsureLibrary() {
-    std::lock_guard<std::mutex> filesystem_lock(filesystem_mutex_);
-    bool mounted;
+    const std::string mount_error = SdCardManager::GetInstance().EnsureMounted();
+    if (!mount_error.empty()) {
+        return mount_error;
+    }
+
     bool scanned;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        mounted = mounted_;
         scanned = scanned_;
     }
-    if (!mounted) {
-        const std::string mount_error = MountCard();
-        if (!mount_error.empty()) {
-            return mount_error;
-        }
-    }
     if (!scanned) {
-        std::string error;
-        if (!ScanLibrary(error)) {
-            return error;
+        std::lock_guard<std::mutex> filesystem_lock(
+            SdCardManager::GetInstance().FilesystemMutex());
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            scanned = scanned_;
+        }
+        if (!scanned) {
+            std::string error;
+            if (!ScanLibrary(error)) {
+                return error;
+            }
         }
     }
     {
@@ -719,54 +732,15 @@ std::string SdMusicPlayer::EnsureLibrary() {
     return {};
 }
 
-std::string SdMusicPlayer::MountCard() {
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = 4,
-        .allocation_unit_size = 16 * 1024,
-        .disk_status_check_enable = true,
-        .use_one_fat = false,
-    };
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = 1;
-    slot.clk = SD_CARD_CLK_GPIO;
-    slot.cmd = SD_CARD_CMD_GPIO;
-    slot.d0 = SD_CARD_D0_GPIO;
-    slot.d1 = GPIO_NUM_NC;
-    slot.d2 = GPIO_NUM_NC;
-    slot.d3 = GPIO_NUM_NC;
-    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-    ESP_LOGI(kTag, "Mounting 1-bit SDMMC: CLK=%d CMD=%d D0=%d",
-             SD_CARD_CLK_GPIO, SD_CARD_CMD_GPIO, SD_CARD_D0_GPIO);
-    const esp_err_t result = esp_vfs_fat_sdmmc_mount(kMountPoint, &host, &slot,
-                                                     &mount_config, &card_);
-    if (result != ESP_OK) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        card_ = nullptr;
-        mounted_ = false;
-        scanned_ = false;
-        ESP_LOGW(kTag, "SD mount failed without formatting: %s", esp_err_to_name(result));
-        return "无法挂载SD卡。请确认已插入FAT32卡；固件不会自动格式化卡。";
-    }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        mounted_ = true;
-        scanned_ = false;
-    }
-    sdmmc_card_print_info(stdout, card_);
-    return {};
-}
-
 bool SdMusicPlayer::ScanLibrary(std::string& error) {
     std::lock_guard<std::mutex> lock(mutex_);
     songs_.clear();
 
-    if (PathExists(std::string(kMountPoint) + "/music")) {
-        ScanDirectory(std::string(kMountPoint) + "/music", true);
+    const std::string mount_point = SdCardManager::GetInstance().MountPoint();
+    if (PathExists(mount_point + "/music")) {
+        ScanDirectory(mount_point + "/music", true);
     }
-    ScanDirectory(kMountPoint, false);
+    ScanDirectory(mount_point, false);
 
     std::sort(songs_.begin(), songs_.end(), [](const Song& left, const Song& right) {
         return LowerAscii(left.title) < LowerAscii(right.title);
@@ -819,20 +793,11 @@ void SdMusicPlayer::AddSong(const std::string& path) {
 }
 
 void SdMusicPlayer::MarkCardUnavailable() {
-    std::lock_guard<std::mutex> filesystem_lock(filesystem_mutex_);
-    sdmmc_card_t* card = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (mounted_) {
-            card = card_;
-        }
-        mounted_ = false;
         scanned_ = false;
-        card_ = nullptr;
     }
-    if (card != nullptr) {
-        esp_vfs_fat_sdcard_unmount(kMountPoint, card);
-    }
+    SdCardManager::GetInstance().MarkUnavailable();
 }
 
 std::string SdMusicPlayer::PlaySong(const std::string& requested_name) {

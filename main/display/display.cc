@@ -62,6 +62,13 @@ void Display::SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
 void Display::ClearMusicLyrics() {
 }
 
+void Display::SetWallpaperLocation(const char* city) {
+}
+
+void Display::SetWallpaperWeather(const char* city, const char* condition,
+                                  int temperature_c, int high_c, int low_c) {
+}
+
 void Display::SetTheme(Theme* theme) {
     current_theme_ = theme;
     Settings settings("display", true);

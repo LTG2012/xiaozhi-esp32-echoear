@@ -3,6 +3,8 @@
 // Standard C++ headers
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
+#include <dirent.h>
 #include <memory>
 #include <array>
 #include <string>
@@ -16,10 +18,12 @@
 // Standard C headers
 #include <sys/time.h>
 #include <time.h>
+#include <sys/stat.h>
 
 // ESP-IDF headers
 #include <esp_log.h>
 #include <esp_lcd_panel_io.h>
+#include <esp_jpeg_common.h>
 #include <esp_timer.h>
 #include <lvgl.h>
 
@@ -33,9 +37,13 @@
 #include "board.h"
 #include "gfx.h"
 #include "expression_emote.h"
+#include "settings.h"
+#include "boards/common/sd_card_manager.h"
+#include "jpeg_to_image.h"
 
 extern "C" {
 LV_FONT_DECLARE(font_puhui_basic_20_4);
+LV_FONT_DECLARE(font_puhui_basic_30_4);
 }
 
 namespace emote {
@@ -63,6 +71,129 @@ static constexpr std::array<int, 3> kMusicRhythmLeftX = {107, 112, 117};
 static constexpr std::array<uint32_t, 3> kMusicRhythmColors = {
     0x2F7185, 0x46A9C7, 0x62D9FF,
 };
+static constexpr int64_t kWallpaperIdleDelayUs = 30LL * 1000 * 1000;
+static constexpr int64_t kWallpaperRotateUs = 30LL * 1000 * 1000;
+static constexpr int64_t kWallpaperFadeUs = 220LL * 1000;
+static constexpr std::array<const char*, 3> kWallpaperAssets = {
+    "wallpaper_dawn.bin",
+    "wallpaper_day.bin",
+    "wallpaper_night.bin",
+};
+static constexpr char kWallpaperDirectory[] = "/wallpapers";
+static constexpr size_t kMaxCustomWallpapers = 64;
+static constexpr off_t kMaxCustomWallpaperBytes = 2 * 1024 * 1024;
+static constexpr uint16_t kMaxCustomWallpaperDimension = 1024;
+
+static bool HasJpegExtension(const char* name)
+{
+    if (name == nullptr) {
+        return false;
+    }
+    const std::string filename(name);
+    const size_t dot = filename.find_last_of('.');
+    if (dot == std::string::npos) {
+        return false;
+    }
+    std::string extension = filename.substr(dot);
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return extension == ".jpg" || extension == ".jpeg";
+}
+
+static bool ReadJpegDimensions(FILE* file, uint16_t& width, uint16_t& height)
+{
+    width = 0;
+    height = 0;
+    if (file == nullptr || std::fgetc(file) != 0xFF || std::fgetc(file) != 0xD8) {
+        return false;
+    }
+    while (true) {
+        int marker_prefix = std::fgetc(file);
+        while (marker_prefix == 0xFF) {
+            marker_prefix = std::fgetc(file);
+        }
+        if (marker_prefix == EOF || marker_prefix == 0xD9 || marker_prefix == 0xDA) {
+            return false;
+        }
+        const int marker = marker_prefix;
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+            continue;
+        }
+        const int length_hi = std::fgetc(file);
+        const int length_lo = std::fgetc(file);
+        if (length_hi == EOF || length_lo == EOF) {
+            return false;
+        }
+        const int segment_length = (length_hi << 8) | length_lo;
+        if (segment_length < 2) {
+            return false;
+        }
+        const bool is_sof = (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 &&
+                             marker != 0xC8 && marker != 0xCC);
+        if (is_sof) {
+            if (segment_length < 8) {
+                return false;
+            }
+            if (std::fgetc(file) == EOF) {
+                return false;
+            }
+            const int height_hi = std::fgetc(file);
+            const int height_lo = std::fgetc(file);
+            const int width_hi = std::fgetc(file);
+            const int width_lo = std::fgetc(file);
+            if (height_hi == EOF || height_lo == EOF || width_hi == EOF || width_lo == EOF) {
+                return false;
+            }
+            height = static_cast<uint16_t>((height_hi << 8) | height_lo);
+            width = static_cast<uint16_t>((width_hi << 8) | width_lo);
+            return width > 0 && height > 0;
+        }
+        if (std::fseek(file, segment_length - 2, SEEK_CUR) != 0) {
+            return false;
+        }
+    }
+}
+
+static bool ParseAssistantWeather(const char* content, std::string& city,
+                                  std::string& condition, int& temperature_c)
+{
+    const std::string text = content ? content : "";
+    const size_t now = text.find("现在");
+    if (now == std::string::npos || now == 0) {
+        return false;
+    }
+
+    const size_t degree = text.find("度", now + strlen("现在"));
+    if (degree == std::string::npos) {
+        return false;
+    }
+    size_t number_end = degree;
+    while (number_end > now && text[number_end - 1] == ' ') {
+        --number_end;
+    }
+    size_t number_begin = number_end;
+    while (number_begin > now && text[number_begin - 1] >= '0' && text[number_begin - 1] <= '9') {
+        --number_begin;
+    }
+    if (number_begin == number_end) {
+        return false;
+    }
+
+    const size_t first_comma = text.find("，", degree + strlen("度"));
+    if (first_comma == std::string::npos) {
+        return false;
+    }
+    const size_t condition_begin = first_comma + strlen("，");
+    const size_t condition_end = text.find_first_of("，。；", condition_begin);
+    city = text.substr(0, now);
+    condition = text.substr(condition_begin, condition_end - condition_begin);
+    if (city.empty() || condition.empty()) {
+        return false;
+    }
+
+    temperature_c = std::atoi(text.substr(number_begin, number_end - number_begin).c_str());
+    return temperature_c >= -100 && temperature_c <= 100;
+}
 
 static std::string FormatMusicPlaybackTime(int elapsed_seconds, int total_seconds)
 {
@@ -408,10 +539,46 @@ EmoteDisplay::EmoteDisplay(const esp_lcd_panel_handle_t panel, const esp_lcd_pan
         .on_color_trans_done = OnFlushIoReady,
     };
     esp_lcd_panel_io_register_event_callbacks(panel_io, &cbs, emote_handle_);
+
+    if (emote_handle_) {
+        wallpaper_image_ = emote_create_obj_by_type(
+            emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "wallpaper_background");
+        wallpaper_fade_ = emote_create_obj_by_type(
+            emote_handle_, EMOTE_OBJ_TYPE_LABEL, "wallpaper_fade");
+        if (wallpaper_image_) {
+            gfx_obj_set_pos(wallpaper_image_, 0, 0);
+            gfx_obj_set_visible(wallpaper_image_, false);
+        }
+        if (wallpaper_fade_) {
+            gfx_obj_set_size(wallpaper_fade_, width_, height_);
+            gfx_obj_set_pos(wallpaper_fade_, 0, 0);
+            gfx_label_set_text(wallpaper_fade_, "");
+            gfx_label_set_bg_color(wallpaper_fade_, GFX_COLOR_HEX(0x000000));
+            gfx_label_set_bg_enable(wallpaper_fade_, true);
+            gfx_label_set_opa(wallpaper_fade_, 0);
+            gfx_obj_set_visible(wallpaper_fade_, false);
+        }
+    }
+    LoadWallpaperSettings();
+    const esp_timer_create_args_t timer_args = {
+        .callback = &EmoteDisplay::WallpaperTimerCallback,
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "wallpaper",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&timer_args, &wallpaper_timer_) == ESP_OK) {
+        esp_timer_start_periodic(wallpaper_timer_, 250 * 1000);
+    }
 }
 
 EmoteDisplay::~EmoteDisplay()
 {
+    if (wallpaper_timer_) {
+        esp_timer_stop(wallpaper_timer_);
+        esp_timer_delete(wallpaper_timer_);
+        wallpaper_timer_ = nullptr;
+    }
     if (emote_handle_) {
         emote_deinit(emote_handle_);
         emote_handle_ = nullptr;
@@ -421,12 +588,22 @@ EmoteDisplay::~EmoteDisplay()
         music_font_ = nullptr;
         music_font_owned_ = false;
     }
+    if (wallpaper_font_owned_ && wallpaper_font_) {
+        gfx_font_lv_delete(static_cast<lv_font_t*>(wallpaper_font_));
+        wallpaper_font_ = nullptr;
+        wallpaper_font_owned_ = false;
+    }
 }
 
 void EmoteDisplay::SetEmotion(const char* const emotion)
 {
     ESP_LOGI(TAG, "SetEmotion: %s", emotion);
+    if (media_transfer_qr_visible_) {
+        return;
+    }
     if (emote_handle_ && emotion && strlen(emotion) > 0) {
+        HideWallpaper();
+        wallpaper_suppressed_until_us_ = esp_timer_get_time() + kWallpaperIdleDelayUs;
         emote_set_anim_emoji(emote_handle_, emotion);
     }
 }
@@ -434,7 +611,15 @@ void EmoteDisplay::SetEmotion(const char* const emotion)
 void EmoteDisplay::SetChatMessage(const char* const role, const char* const content)
 {
     ESP_LOGI(TAG, "SetChatMessage: %s, %s", role, content);
+    if (media_transfer_qr_visible_) {
+        return;
+    }
     if (emote_handle_ && content && strlen(content) > 0) {
+        if (role && std::strcmp(role, "assistant") == 0) {
+            CacheWeatherFromAssistantMessage(content);
+        }
+        HideWallpaper();
+        wallpaper_suppressed_until_us_ = esp_timer_get_time() + kWallpaperIdleDelayUs;
         if ((std::strcmp(role, "system") == 0) && std::strstr(content, "xiaozhi.me")) {
             size_t len = strlen(content);
             char* new_content = new char[len + 1];
@@ -451,14 +636,25 @@ void EmoteDisplay::SetChatMessage(const char* const role, const char* const cont
 void EmoteDisplay::SetStatus(const char* const status)
 {
     ESP_LOGI(TAG, "SetStatus: %s", status);
+    if (media_transfer_qr_visible_) {
+        return;
+    }
     if (emote_handle_ && status && strlen(status) > 0) {
         if (std::strcmp(status, Lang::Strings::LISTENING) == 0) {
+            wallpaper_idle_ = false;
+            HideWallpaper();
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_LISTEN, NULL);
         } else if (std::strcmp(status, Lang::Strings::STANDBY) == 0) {
+            wallpaper_idle_ = true;
+            wallpaper_idle_since_us_ = esp_timer_get_time();
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_IDLE, NULL);
         } else if (std::strcmp(status, Lang::Strings::SPEAKING) == 0) {
+            wallpaper_idle_ = false;
+            HideWallpaper();
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SPEAK, NULL);
         } else if (std::strcmp(status, Lang::Strings::ERROR) == 0) {
+            wallpaper_idle_ = false;
+            HideWallpaper();
             emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SET, NULL);
         }
     }
@@ -467,7 +663,13 @@ void EmoteDisplay::SetStatus(const char* const status)
 void EmoteDisplay::ShowNotification(const char* notification, int duration_ms)
 {
     ESP_LOGI(TAG, "ShowNotification: %s", notification);
+    if (media_transfer_qr_visible_) {
+        return;
+    }
     if (emote_handle_ && notification && strlen(notification) > 0) {
+        HideWallpaper();
+        wallpaper_suppressed_until_us_ = esp_timer_get_time() +
+            static_cast<int64_t>(std::max(0, duration_ms)) * 1000 + kWallpaperIdleDelayUs;
         emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_SYS, notification);
     }
 }
@@ -840,6 +1042,9 @@ void EmoteDisplay::SetMusicLyrics(const char* title, const char* lyrics)
         return;
     }
 
+    wallpaper_music_active_ = true;
+    HideWallpaper();
+
     // EVT_SPEAK hides the battery and replaces it with the speaker icon. Keep
     // music on an independent overlay and explicitly restore the idle status bar.
     UpdateStatusBar();
@@ -980,6 +1185,573 @@ void EmoteDisplay::ClearMusicLyrics()
         music_progress_visible_ = false;
     }
     emote_unlock(emote_handle_);
+    wallpaper_music_active_ = false;
+    wallpaper_idle_since_us_ = esp_timer_get_time();
+}
+
+void EmoteDisplay::SetWallpaperLocation(const char* city)
+{
+    if (city == nullptr || city[0] == '\0') {
+        return;
+    }
+    wallpaper_city_ = city;
+    SaveWallpaperSettings();
+    UpdateWallpaperText(true);
+}
+
+void EmoteDisplay::SetWallpaperWeather(const char* city, const char* condition,
+                                       int temperature_c, int high_c, int low_c)
+{
+    if (condition == nullptr || condition[0] == '\0') {
+        return;
+    }
+    if (city != nullptr && city[0] != '\0') {
+        wallpaper_city_ = city;
+    }
+    wallpaper_condition_ = condition;
+    wallpaper_temperature_c_ = temperature_c;
+    wallpaper_high_c_ = high_c;
+    wallpaper_low_c_ = low_c;
+    SaveWallpaperSettings();
+    UpdateWallpaperText(true);
+}
+
+void EmoteDisplay::CacheWeatherFromAssistantMessage(const char* content)
+{
+    std::string city;
+    std::string condition;
+    int temperature_c = 0;
+    if (!ParseAssistantWeather(content, city, condition, temperature_c)) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Cached weather from assistant: %s, %s, %dC",
+             city.c_str(), condition.c_str(), temperature_c);
+    SetWallpaperWeather(city.c_str(), condition.c_str(), temperature_c,
+                        kWallpaperUnsetTemperature, kWallpaperUnsetTemperature);
+}
+
+void EmoteDisplay::WallpaperTimerCallback(void* arg)
+{
+    static_cast<EmoteDisplay*>(arg)->TickWallpaper();
+}
+
+bool EmoteDisplay::EnsureWallpaperUi()
+{
+    if (!emote_handle_ || !wallpaper_image_ || !wallpaper_fade_) {
+        return false;
+    }
+    if (wallpaper_date_ && wallpaper_time_ && wallpaper_weather_) {
+        return true;
+    }
+
+    wallpaper_date_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "wallpaper_date");
+    wallpaper_time_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "wallpaper_time");
+    wallpaper_weather_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "wallpaper_weather");
+    if (!wallpaper_date_ || !wallpaper_time_ || !wallpaper_weather_) {
+        ESP_LOGE(TAG, "Failed to create wallpaper UI");
+        return false;
+    }
+
+    wallpaper_font_ = LoadMusicFontFromAssets();
+    if (wallpaper_font_) {
+        wallpaper_font_owned_ = true;
+    } else {
+        wallpaper_font_ = static_cast<gfx_font_t>(const_cast<lv_font_t*>(&font_puhui_basic_20_4));
+    }
+
+    emote_lock(emote_handle_);
+    gfx_obj_set_size(wallpaper_date_, std::max(1, width_ - 56), 30);
+    gfx_obj_align(wallpaper_date_, GFX_ALIGN_TOP_MID, 0, 72);
+    gfx_label_set_font(wallpaper_date_, wallpaper_font_);
+    gfx_label_set_color(wallpaper_date_, GFX_COLOR_HEX(0xF5F7FA));
+    gfx_label_set_text_align(wallpaper_date_, GFX_TEXT_ALIGN_CENTER);
+
+    gfx_obj_set_size(wallpaper_time_, std::max(1, width_ - 72), 60);
+    gfx_obj_align(wallpaper_time_, GFX_ALIGN_TOP_MID, 0, 108);
+    gfx_label_set_font(wallpaper_time_, static_cast<gfx_font_t>(const_cast<lv_font_t*>(&font_puhui_basic_30_4)));
+    gfx_label_set_color(wallpaper_time_, GFX_COLOR_HEX(0xFFFFFF));
+    gfx_label_set_text_align(wallpaper_time_, GFX_TEXT_ALIGN_CENTER);
+
+    gfx_obj_set_size(wallpaper_weather_, std::max(1, width_ - 52), 60);
+    gfx_obj_align(wallpaper_weather_, GFX_ALIGN_TOP_MID, 0, 218);
+    gfx_label_set_font(wallpaper_weather_, wallpaper_font_);
+    gfx_label_set_color(wallpaper_weather_, GFX_COLOR_HEX(0xF5F7FA));
+    gfx_label_set_text_align(wallpaper_weather_, GFX_TEXT_ALIGN_CENTER);
+    gfx_label_set_long_mode(wallpaper_weather_, GFX_LABEL_LONG_WRAP);
+    gfx_label_set_line_spacing(wallpaper_weather_, 4);
+
+    gfx_obj_set_visible(wallpaper_date_, false);
+    gfx_obj_set_visible(wallpaper_time_, false);
+    gfx_obj_set_visible(wallpaper_weather_, false);
+    emote_unlock(emote_handle_);
+    return true;
+}
+
+bool EmoteDisplay::LoadWallpaperAsset(int index)
+{
+    if (index < 0 || index >= static_cast<int>(kWallpaperAssets.size())) {
+        return false;
+    }
+    void* data = nullptr;
+    size_t size = 0;
+    if (!Assets::GetInstance().GetAssetData(kWallpaperAssets[index], data, size) ||
+        data == nullptr || size <= sizeof(gfx_image_header_t)) {
+        ESP_LOGW(TAG, "Unable to load wallpaper asset %s", kWallpaperAssets[index]);
+        return false;
+    }
+    std::memcpy(&wallpaper_image_dsc_.header, data, sizeof(gfx_image_header_t));
+    wallpaper_image_dsc_.data_size = static_cast<uint32_t>(size - sizeof(gfx_image_header_t));
+    wallpaper_image_dsc_.data = static_cast<const uint8_t*>(data) + sizeof(gfx_image_header_t);
+    wallpaper_image_dsc_.reserved = nullptr;
+    wallpaper_image_dsc_.reserved_2 = nullptr;
+    return wallpaper_image_dsc_.header.magic == C_ARRAY_HEADER_MAGIC &&
+        wallpaper_image_dsc_.header.w == width_ && wallpaper_image_dsc_.header.h == height_;
+}
+
+size_t EmoteDisplay::WallpaperCount()
+{
+    std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+    return custom_wallpaper_paths_.empty() ? kWallpaperAssets.size() : custom_wallpaper_paths_.size();
+}
+
+bool EmoteDisplay::ScanCustomWallpapers(std::string& result)
+{
+    auto& sd_card = SdCardManager::GetInstance();
+    const std::string mount_error = sd_card.EnsureMounted();
+    if (!mount_error.empty()) {
+        result = mount_error;
+        return false;
+    }
+
+    std::vector<std::string> paths;
+    const std::string directory = std::string(sd_card.MountPoint()) + kWallpaperDirectory;
+    std::lock_guard<std::mutex> filesystem_lock(sd_card.FilesystemMutex());
+    if (mkdir(directory.c_str(), 0775) != 0 && errno != EEXIST) {
+        result = "Unable to create /wallpapers on the SD card.";
+        ESP_LOGW(TAG, "%s: %s", result.c_str(), strerror(errno));
+        return false;
+    }
+
+    DIR* folder = opendir(directory.c_str());
+    if (folder == nullptr) {
+        result = "Unable to open /wallpapers on the SD card.";
+        ESP_LOGW(TAG, "%s: %s", result.c_str(), strerror(errno));
+        return false;
+    }
+    while (paths.size() < kMaxCustomWallpapers) {
+        dirent* entry = readdir(folder);
+        if (entry == nullptr) {
+            break;
+        }
+        if (!HasJpegExtension(entry->d_name)) {
+            continue;
+        }
+        const std::string path = directory + "/" + entry->d_name;
+        struct stat info = {};
+        if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_size <= 0 ||
+            info.st_size > kMaxCustomWallpaperBytes) {
+            ESP_LOGW(TAG, "Skipping custom wallpaper %s: invalid size", entry->d_name);
+            continue;
+        }
+        FILE* file = std::fopen(path.c_str(), "rb");
+        uint16_t image_width = 0;
+        uint16_t image_height = 0;
+        const bool valid = file != nullptr && ReadJpegDimensions(file, image_width, image_height);
+        if (file != nullptr) {
+            std::fclose(file);
+        }
+        if (!valid || image_width > kMaxCustomWallpaperDimension ||
+            image_height > kMaxCustomWallpaperDimension) {
+            ESP_LOGW(TAG, "Skipping custom wallpaper %s: invalid JPEG dimensions", entry->d_name);
+            continue;
+        }
+        paths.push_back(path);
+    }
+    closedir(folder);
+
+    std::sort(paths.begin(), paths.end());
+    {
+        std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+        custom_wallpaper_paths_ = std::move(paths);
+        custom_wallpaper_pixels_.clear();
+    }
+    result = "Custom wallpaper scan found " + std::to_string(WallpaperCount()) + " JPEG file(s).";
+    return true;
+}
+
+std::string EmoteDisplay::RefreshCustomWallpapers()
+{
+    HideWallpaper();
+    std::string result;
+    if (!ScanCustomWallpapers(result)) {
+        std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+        custom_wallpaper_paths_.clear();
+        custom_wallpaper_pixels_.clear();
+    }
+    wallpaper_index_ = 0;
+    wallpaper_shown_since_us_ = 0;
+    ESP_LOGI(TAG, "%s", result.c_str());
+    return result;
+}
+
+void EmoteDisplay::RequestCustomWallpaperRefresh()
+{
+    wallpaper_refresh_requested_.store(true, std::memory_order_release);
+}
+
+bool EmoteDisplay::LoadCustomWallpaper(int index)
+{
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+        if (index < 0 || index >= static_cast<int>(custom_wallpaper_paths_.size())) {
+            return false;
+        }
+        path = custom_wallpaper_paths_[index];
+    }
+
+    auto& sd_card = SdCardManager::GetInstance();
+    if (!sd_card.EnsureMounted().empty()) {
+        return false;
+    }
+    std::vector<uint8_t> jpeg;
+    {
+        std::lock_guard<std::mutex> filesystem_lock(sd_card.FilesystemMutex());
+        struct stat info = {};
+        if (stat(path.c_str(), &info) != 0 || info.st_size <= 0 ||
+            info.st_size > kMaxCustomWallpaperBytes) {
+            return false;
+        }
+        FILE* file = std::fopen(path.c_str(), "rb");
+        if (file == nullptr) {
+            return false;
+        }
+        jpeg.resize(static_cast<size_t>(info.st_size));
+        const size_t read = std::fread(jpeg.data(), 1, jpeg.size(), file);
+        std::fclose(file);
+        if (read != jpeg.size()) {
+            return false;
+        }
+    }
+
+    uint8_t* decoded = nullptr;
+    size_t decoded_size = 0;
+    size_t source_width = 0;
+    size_t source_height = 0;
+    size_t source_stride = 0;
+    if (jpeg_to_image(jpeg.data(), jpeg.size(), &decoded, &decoded_size, &source_width,
+                      &source_height, &source_stride) != ESP_OK || decoded == nullptr ||
+        source_width == 0 || source_height == 0 || source_width > kMaxCustomWallpaperDimension ||
+        source_height > kMaxCustomWallpaperDimension ||
+        source_stride < source_width * sizeof(uint16_t) ||
+        decoded_size < source_stride * source_height) {
+        if (decoded != nullptr) {
+            jpeg_free_align(decoded);
+        }
+        return false;
+    }
+
+    const float scale = std::max(static_cast<float>(width_) / source_width,
+                                 static_cast<float>(height_) / source_height);
+    const float crop_width = static_cast<float>(width_) / scale;
+    const float crop_height = static_cast<float>(height_) / scale;
+    const float crop_x = (static_cast<float>(source_width) - crop_width) / 2.0f;
+    const float crop_y = (static_cast<float>(source_height) - crop_height) / 2.0f;
+    std::vector<uint8_t> pixels(static_cast<size_t>(width_) * height_ * sizeof(uint16_t));
+    for (int y = 0; y < height_; ++y) {
+        const size_t source_y = std::min(source_height - 1, static_cast<size_t>(
+            std::max(0.0f, crop_y + (static_cast<float>(y) + 0.5f) / scale)));
+        for (int x = 0; x < width_; ++x) {
+            const size_t source_x = std::min(source_width - 1, static_cast<size_t>(
+                std::max(0.0f, crop_x + (static_cast<float>(x) + 0.5f) / scale)));
+            const size_t source_offset = source_y * source_stride + source_x * sizeof(uint16_t);
+            const size_t target_offset = (static_cast<size_t>(y) * width_ + x) * sizeof(uint16_t);
+            pixels[target_offset] = decoded[source_offset + 1];
+            pixels[target_offset + 1] = decoded[source_offset];
+        }
+    }
+    jpeg_free_align(decoded);
+
+    std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+    custom_wallpaper_pixels_ = std::move(pixels);
+    wallpaper_image_dsc_.header.magic = C_ARRAY_HEADER_MAGIC;
+    wallpaper_image_dsc_.header.cf = GFX_COLOR_FORMAT_RGB565;
+    wallpaper_image_dsc_.header.flags = 0;
+    wallpaper_image_dsc_.header.w = width_;
+    wallpaper_image_dsc_.header.h = height_;
+    wallpaper_image_dsc_.header.stride = width_ * sizeof(uint16_t);
+    wallpaper_image_dsc_.header.reserved = 0;
+    wallpaper_image_dsc_.data_size = custom_wallpaper_pixels_.size();
+    wallpaper_image_dsc_.data = custom_wallpaper_pixels_.data();
+    wallpaper_image_dsc_.reserved = nullptr;
+    wallpaper_image_dsc_.reserved_2 = nullptr;
+    return true;
+}
+
+bool EmoteDisplay::LoadWallpaper(int index)
+{
+    bool has_custom_wallpapers = false;
+    {
+        std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+        has_custom_wallpapers = !custom_wallpaper_paths_.empty();
+    }
+    if (!has_custom_wallpapers) {
+        return LoadWallpaperAsset(index);
+    }
+    if (LoadCustomWallpaper(index)) {
+        return true;
+    }
+    ESP_LOGW(TAG, "Custom wallpaper %d failed; using an internal wallpaper", index);
+    return LoadWallpaperAsset(index % kWallpaperAssets.size());
+}
+
+void EmoteDisplay::SetWallpaperNativeUiVisible(bool visible)
+{
+    if (!emote_handle_) {
+        return;
+    }
+
+    emote_lock(emote_handle_);
+    if (auto* eye = emote_get_obj_by_name(emote_handle_, EMT_DEF_ELEM_EYE_ANIM)) {
+        gfx_obj_set_visible(eye, visible);
+    }
+    if (auto* clock = emote_get_obj_by_name(emote_handle_, EMT_DEF_ELEM_CLOCK_LABEL)) {
+        gfx_obj_set_visible(clock, visible);
+    }
+    if (auto* timer = emote_get_obj_by_name(emote_handle_, EMT_DEF_ELEM_TIMER_STATUS)) {
+        if (visible) {
+            gfx_timer_resume(static_cast<gfx_timer_handle_t>(timer));
+        } else {
+            gfx_timer_pause(static_cast<gfx_timer_handle_t>(timer));
+        }
+    }
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::ShowWallpaper()
+{
+    if (!EnsureWallpaperUi() || !LoadWallpaper(wallpaper_index_)) {
+        wallpaper_suppressed_until_us_ = esp_timer_get_time() + kWallpaperIdleDelayUs;
+        return;
+    }
+    wallpaper_visible_ = true;
+    wallpaper_shown_since_us_ = esp_timer_get_time();
+    wallpaper_fade_until_us_ = wallpaper_shown_since_us_ + kWallpaperFadeUs;
+    // The wallpaper background was intentionally created before the native
+    // Emote objects so the battery indicator remains above it. Hide only the
+    // native face and clock; otherwise they cover the image and duplicate time.
+    SetWallpaperNativeUiVisible(false);
+    emote_lock(emote_handle_);
+    gfx_img_set_src(wallpaper_image_, &wallpaper_image_dsc_);
+    gfx_obj_set_visible(wallpaper_image_, true);
+    gfx_label_set_opa(wallpaper_fade_, 115);
+    gfx_obj_set_visible(wallpaper_fade_, true);
+    gfx_obj_set_visible(wallpaper_date_, true);
+    gfx_obj_set_visible(wallpaper_time_, true);
+    gfx_obj_set_visible(wallpaper_weather_, !wallpaper_condition_.empty());
+    emote_unlock(emote_handle_);
+    UpdateWallpaperText(true);
+    UpdateStatusBar();
+}
+
+void EmoteDisplay::HideWallpaper()
+{
+    if (!wallpaper_visible_ || !emote_handle_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    gfx_obj_set_visible(wallpaper_image_, false);
+    gfx_obj_set_visible(wallpaper_fade_, false);
+    if (wallpaper_date_) {
+        gfx_obj_set_visible(wallpaper_date_, false);
+        gfx_obj_set_visible(wallpaper_time_, false);
+        gfx_obj_set_visible(wallpaper_weather_, false);
+    }
+    emote_unlock(emote_handle_);
+    wallpaper_visible_ = false;
+    wallpaper_last_minute_ = -1;
+    SetWallpaperNativeUiVisible(true);
+}
+
+bool EmoteDisplay::ShowMediaTransferQr(const char* url)
+{
+    if (!emote_handle_ || !url) {
+        return false;
+    }
+    HideWallpaper();
+    if (!media_transfer_qr_) {
+        media_transfer_qr_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_QRCODE,
+                                                       "media_transfer_qr");
+    }
+    if (!media_transfer_info_) {
+        media_transfer_info_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
+                                                         "media_transfer_info");
+    }
+    auto* qr = media_transfer_qr_;
+    if (!qr || !media_transfer_info_) {
+        ESP_LOGW(TAG, "Unable to create wallpaper server display objects");
+        return false;
+    }
+    const char* address = std::strstr(url, "//");
+    address = address ? address + 2 : url;
+    char info[96];
+    std::snprintf(info, sizeof(info), "%s", address);
+    emote_lock(emote_handle_);
+    gfx_qrcode_set_size(qr, 200);
+    gfx_qrcode_set_color(qr, GFX_COLOR_HEX(0x000000));
+    gfx_qrcode_set_bg_color(qr, GFX_COLOR_HEX(0xFFFFFF));
+    gfx_obj_align(qr, GFX_ALIGN_CENTER, 0, -28);
+    gfx_obj_set_size(media_transfer_info_, width_ - 24, 68);
+    gfx_obj_align(media_transfer_info_, GFX_ALIGN_BOTTOM_MID, 0, -8);
+    gfx_label_set_font(media_transfer_info_, static_cast<gfx_font_t>(const_cast<lv_font_t*>(&font_puhui_basic_20_4)));
+    gfx_label_set_color(media_transfer_info_, GFX_COLOR_HEX(0xF4F8FF));
+    gfx_label_set_text_align(media_transfer_info_, GFX_TEXT_ALIGN_CENTER);
+    gfx_label_set_text(media_transfer_info_, info);
+    emote_unlock(emote_handle_);
+    emote_lock(emote_handle_);
+    const esp_err_t result = gfx_qrcode_set_data(qr, url);
+    if (result == ESP_OK) {
+        gfx_obj_set_visible(qr, true);
+        gfx_obj_set_visible(media_transfer_info_, true);
+    }
+    emote_unlock(emote_handle_);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to show media transfer QR: %s", esp_err_to_name(result));
+        return false;
+    }
+    SetWallpaperNativeUiVisible(false);
+    media_transfer_qr_visible_ = true;
+    return true;
+}
+
+void EmoteDisplay::HideMediaTransferQr()
+{
+    if (!emote_handle_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    if (media_transfer_qr_) {
+        gfx_obj_set_visible(media_transfer_qr_, false);
+    }
+    if (media_transfer_info_) {
+        gfx_obj_set_visible(media_transfer_info_, false);
+    }
+    emote_unlock(emote_handle_);
+    media_transfer_qr_visible_ = false;
+    SetWallpaperNativeUiVisible(true);
+    emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_IDLE, nullptr);
+}
+
+void EmoteDisplay::TickWallpaper()
+{
+    if (wallpaper_refresh_requested_.exchange(false, std::memory_order_acq_rel)) {
+        RefreshCustomWallpapers();
+    }
+    if (media_transfer_qr_visible_) {
+        return;
+    }
+    const int64_t now_us = esp_timer_get_time();
+    const bool eligible = wallpaper_idle_ && !wallpaper_music_active_ &&
+        now_us >= wallpaper_suppressed_until_us_ &&
+        wallpaper_idle_since_us_ > 0 &&
+        now_us - wallpaper_idle_since_us_ >= kWallpaperIdleDelayUs;
+    if (!eligible) {
+        HideWallpaper();
+        return;
+    }
+    if (!wallpaper_visible_) {
+        ShowWallpaper();
+        return;
+    }
+    if (wallpaper_fade_until_us_ > 0 && now_us >= wallpaper_fade_until_us_) {
+        emote_lock(emote_handle_);
+        gfx_obj_set_visible(wallpaper_fade_, false);
+        emote_unlock(emote_handle_);
+        wallpaper_fade_until_us_ = 0;
+    }
+    if (now_us - wallpaper_shown_since_us_ >= kWallpaperRotateUs) {
+        const size_t wallpaper_count = WallpaperCount();
+        if (wallpaper_count == 0) {
+            return;
+        }
+        wallpaper_index_ = (wallpaper_index_ + 1) % wallpaper_count;
+        if (LoadWallpaper(wallpaper_index_)) {
+            emote_lock(emote_handle_);
+            gfx_label_set_opa(wallpaper_fade_, 115);
+            gfx_obj_set_visible(wallpaper_fade_, true);
+            gfx_img_set_src(wallpaper_image_, &wallpaper_image_dsc_);
+            emote_unlock(emote_handle_);
+            wallpaper_shown_since_us_ = now_us;
+            wallpaper_fade_until_us_ = now_us + kWallpaperFadeUs;
+        }
+    }
+    UpdateWallpaperText(false);
+}
+
+void EmoteDisplay::UpdateWallpaperText(bool force)
+{
+    if (!wallpaper_visible_ || !wallpaper_date_ || !wallpaper_time_ || !wallpaper_weather_) {
+        return;
+    }
+    time_t now = time(nullptr);
+    struct tm local_time = {};
+    localtime_r(&now, &local_time);
+    const int minute_key = local_time.tm_yday * 24 * 60 + local_time.tm_hour * 60 + local_time.tm_min;
+    if (!force && minute_key == wallpaper_last_minute_) {
+        return;
+    }
+    static constexpr std::array<const char*, 7> weekdays = {
+        "周日", "周一", "周二", "周三", "周四", "周五", "周六",
+    };
+    char date[40] = {};
+    char clock[16] = {};
+    snprintf(date, sizeof(date), "%04d-%02d-%02d  %s", local_time.tm_year + 1900,
+             local_time.tm_mon + 1, local_time.tm_mday, weekdays[local_time.tm_wday]);
+    snprintf(clock, sizeof(clock), "%02d:%02d", local_time.tm_hour, local_time.tm_min);
+    std::string weather;
+    if (!wallpaper_condition_.empty()) {
+        const std::string city = wallpaper_city_.empty() ? "本地" : wallpaper_city_;
+        weather = city + " · " + wallpaper_condition_ + " · " +
+            std::to_string(wallpaper_temperature_c_) + "°C";
+        if (wallpaper_high_c_ != kWallpaperUnsetTemperature &&
+            wallpaper_low_c_ != kWallpaperUnsetTemperature) {
+            weather += "  " + std::to_string(wallpaper_low_c_) + "~" +
+                std::to_string(wallpaper_high_c_) + "°C";
+        }
+    }
+    emote_lock(emote_handle_);
+    gfx_label_set_text(wallpaper_date_, date);
+    gfx_label_set_text(wallpaper_time_, clock);
+    gfx_label_set_text(wallpaper_weather_, weather.c_str());
+    gfx_obj_set_visible(wallpaper_weather_, !weather.empty());
+    emote_unlock(emote_handle_);
+    wallpaper_last_minute_ = minute_key;
+}
+
+void EmoteDisplay::LoadWallpaperSettings()
+{
+    Settings settings("wallpaper", false);
+    wallpaper_city_ = settings.GetString("city");
+    if (settings.GetBool("weather_valid", false)) {
+        wallpaper_condition_ = settings.GetString("condition");
+        wallpaper_temperature_c_ = settings.GetInt("temperature_c", kWallpaperUnsetTemperature);
+        wallpaper_high_c_ = settings.GetInt("high_c", kWallpaperUnsetTemperature);
+        wallpaper_low_c_ = settings.GetInt("low_c", kWallpaperUnsetTemperature);
+    }
+}
+
+void EmoteDisplay::SaveWallpaperSettings()
+{
+    Settings settings("wallpaper", true);
+    settings.SetString("city", wallpaper_city_);
+    settings.SetBool("weather_valid", !wallpaper_condition_.empty());
+    if (!wallpaper_condition_.empty()) {
+        settings.SetString("condition", wallpaper_condition_);
+        settings.SetInt("temperature_c", wallpaper_temperature_c_);
+        settings.SetInt("high_c", wallpaper_high_c_);
+        settings.SetInt("low_c", wallpaper_low_c_);
+    }
 }
 
 void EmoteDisplay::SetPowerSaveMode(bool on)
@@ -1025,6 +1797,9 @@ bool EmoteDisplay::InsertAnimDialog(const char* emoji_name, uint32_t duration_ms
 {
     ESP_LOGI(TAG, "InsertAnimDialog: %s, %" PRIu32, emoji_name, duration_ms);
     if (emote_handle_ && emoji_name) {
+        HideWallpaper();
+        wallpaper_suppressed_until_us_ = esp_timer_get_time() +
+            static_cast<int64_t>(duration_ms) * 1000 + kWallpaperIdleDelayUs;
         return emote_insert_anim_dialog(emote_handle_, emoji_name, duration_ms);
     }
     return false;

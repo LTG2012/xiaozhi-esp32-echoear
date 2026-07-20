@@ -9,14 +9,14 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <sdmmc_cmd.h>
-
 class SdMusicPlayer {
 public:
     SdMusicPlayer();
     ~SdMusicPlayer();
 
     void RegisterMcpTools();
+    bool IsActive() const;
+    void RequestLibraryRefresh();
 
 private:
     struct Song {
@@ -46,11 +46,8 @@ private:
     static constexpr uint32_t kOutputSampleRate = 24000;
     static constexpr size_t kPcmChunkSamples = 960;
 
-    std::mutex mutex_;
-    std::mutex filesystem_mutex_;
+    mutable std::mutex mutex_;
     std::vector<Song> songs_;
-    sdmmc_card_t* card_ = nullptr;
-    bool mounted_ = false;
     bool scanned_ = false;
     State state_ = State::kStopped;
     int current_index_ = -1;
@@ -81,7 +78,6 @@ private:
     bool IsCurrentGeneration(uint32_t generation);
 
     std::string EnsureLibrary();
-    std::string MountCard();
     bool ScanLibrary(std::string& error);
     void ScanDirectory(const std::string& path, bool recursive);
     void AddSong(const std::string& path);
