@@ -598,6 +598,9 @@ EmoteDisplay::~EmoteDisplay()
 void EmoteDisplay::SetEmotion(const char* const emotion)
 {
     ESP_LOGI(TAG, "SetEmotion: %s", emotion);
+    if (media_transfer_qr_visible_) {
+        return;
+    }
     if (emote_handle_ && emotion && strlen(emotion) > 0) {
         HideWallpaper();
         wallpaper_suppressed_until_us_ = esp_timer_get_time() + kWallpaperIdleDelayUs;
@@ -608,6 +611,9 @@ void EmoteDisplay::SetEmotion(const char* const emotion)
 void EmoteDisplay::SetChatMessage(const char* const role, const char* const content)
 {
     ESP_LOGI(TAG, "SetChatMessage: %s, %s", role, content);
+    if (media_transfer_qr_visible_) {
+        return;
+    }
     if (emote_handle_ && content && strlen(content) > 0) {
         if (role && std::strcmp(role, "assistant") == 0) {
             CacheWeatherFromAssistantMessage(content);
@@ -630,6 +636,9 @@ void EmoteDisplay::SetChatMessage(const char* const role, const char* const cont
 void EmoteDisplay::SetStatus(const char* const status)
 {
     ESP_LOGI(TAG, "SetStatus: %s", status);
+    if (media_transfer_qr_visible_) {
+        return;
+    }
     if (emote_handle_ && status && strlen(status) > 0) {
         if (std::strcmp(status, Lang::Strings::LISTENING) == 0) {
             wallpaper_idle_ = false;
@@ -654,6 +663,9 @@ void EmoteDisplay::SetStatus(const char* const status)
 void EmoteDisplay::ShowNotification(const char* notification, int duration_ms)
 {
     ESP_LOGI(TAG, "ShowNotification: %s", notification);
+    if (media_transfer_qr_visible_) {
+        return;
+    }
     if (emote_handle_ && notification && strlen(notification) > 0) {
         HideWallpaper();
         wallpaper_suppressed_until_us_ = esp_timer_get_time() +
@@ -1383,6 +1395,11 @@ std::string EmoteDisplay::RefreshCustomWallpapers()
     return result;
 }
 
+void EmoteDisplay::RequestCustomWallpaperRefresh()
+{
+    wallpaper_refresh_requested_.store(true, std::memory_order_release);
+}
+
 bool EmoteDisplay::LoadCustomWallpaper(int index)
 {
     std::string path;
@@ -1557,8 +1574,83 @@ void EmoteDisplay::HideWallpaper()
     SetWallpaperNativeUiVisible(true);
 }
 
+bool EmoteDisplay::ShowMediaTransferQr(const char* url)
+{
+    if (!emote_handle_ || !url) {
+        return false;
+    }
+    HideWallpaper();
+    if (!media_transfer_qr_) {
+        media_transfer_qr_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_QRCODE,
+                                                       "media_transfer_qr");
+    }
+    if (!media_transfer_info_) {
+        media_transfer_info_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
+                                                         "media_transfer_info");
+    }
+    auto* qr = media_transfer_qr_;
+    if (!qr || !media_transfer_info_) {
+        ESP_LOGW(TAG, "Unable to create wallpaper server display objects");
+        return false;
+    }
+    const char* address = std::strstr(url, "//");
+    address = address ? address + 2 : url;
+    char info[96];
+    std::snprintf(info, sizeof(info), "%s", address);
+    emote_lock(emote_handle_);
+    gfx_qrcode_set_size(qr, 200);
+    gfx_qrcode_set_color(qr, GFX_COLOR_HEX(0x000000));
+    gfx_qrcode_set_bg_color(qr, GFX_COLOR_HEX(0xFFFFFF));
+    gfx_obj_align(qr, GFX_ALIGN_CENTER, 0, -28);
+    gfx_obj_set_size(media_transfer_info_, width_ - 24, 68);
+    gfx_obj_align(media_transfer_info_, GFX_ALIGN_BOTTOM_MID, 0, -8);
+    gfx_label_set_font(media_transfer_info_, static_cast<gfx_font_t>(const_cast<lv_font_t*>(&font_puhui_basic_20_4)));
+    gfx_label_set_color(media_transfer_info_, GFX_COLOR_HEX(0xF4F8FF));
+    gfx_label_set_text_align(media_transfer_info_, GFX_TEXT_ALIGN_CENTER);
+    gfx_label_set_text(media_transfer_info_, info);
+    emote_unlock(emote_handle_);
+    emote_lock(emote_handle_);
+    const esp_err_t result = gfx_qrcode_set_data(qr, url);
+    if (result == ESP_OK) {
+        gfx_obj_set_visible(qr, true);
+        gfx_obj_set_visible(media_transfer_info_, true);
+    }
+    emote_unlock(emote_handle_);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to show media transfer QR: %s", esp_err_to_name(result));
+        return false;
+    }
+    SetWallpaperNativeUiVisible(false);
+    media_transfer_qr_visible_ = true;
+    return true;
+}
+
+void EmoteDisplay::HideMediaTransferQr()
+{
+    if (!emote_handle_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    if (media_transfer_qr_) {
+        gfx_obj_set_visible(media_transfer_qr_, false);
+    }
+    if (media_transfer_info_) {
+        gfx_obj_set_visible(media_transfer_info_, false);
+    }
+    emote_unlock(emote_handle_);
+    media_transfer_qr_visible_ = false;
+    SetWallpaperNativeUiVisible(true);
+    emote_set_event_msg(emote_handle_, EMOTE_MGR_EVT_IDLE, nullptr);
+}
+
 void EmoteDisplay::TickWallpaper()
 {
+    if (wallpaper_refresh_requested_.exchange(false, std::memory_order_acq_rel)) {
+        RefreshCustomWallpapers();
+    }
+    if (media_transfer_qr_visible_) {
+        return;
+    }
     const int64_t now_us = esp_timer_get_time();
     const bool eligible = wallpaper_idle_ && !wallpaper_music_active_ &&
         now_us >= wallpaper_suppressed_until_us_ &&

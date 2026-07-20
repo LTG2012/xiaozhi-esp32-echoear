@@ -1,6 +1,7 @@
 #pragma once
 
 #include "display.h"
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -9,6 +10,7 @@
 #include <esp_lcd_panel_ops.h>
 #include "expression_emote.h"
 #include "widget/gfx_img.h"
+#include "widget/gfx_qrcode.h"
 
 namespace emote {
 
@@ -38,6 +40,9 @@ public:
     bool StopAnimDialog();
     bool InsertAnimDialog(const char* emoji_name, uint32_t duration_ms);
     std::string RefreshCustomWallpapers();
+    void RequestCustomWallpaperRefresh();
+    bool ShowMediaTransferQr(const char* url);
+    void HideMediaTransferQr();
 
     void RefreshAll();
 
@@ -80,6 +85,9 @@ private:
     gfx_obj_t* wallpaper_date_ = nullptr;
     gfx_obj_t* wallpaper_time_ = nullptr;
     gfx_obj_t* wallpaper_weather_ = nullptr;
+    gfx_obj_t* media_transfer_qr_ = nullptr;
+    gfx_obj_t* media_transfer_info_ = nullptr;
+    bool media_transfer_qr_visible_ = false;
     gfx_font_t wallpaper_font_ = nullptr;
     bool wallpaper_font_owned_ = false;
     gfx_image_dsc_t wallpaper_image_dsc_ = {};
@@ -90,6 +98,7 @@ private:
     bool wallpaper_idle_ = false;
     bool wallpaper_music_active_ = false;
     bool wallpaper_visible_ = false;
+    std::atomic<bool> wallpaper_refresh_requested_ = false;
     int wallpaper_index_ = 0;
     int wallpaper_last_minute_ = -1;
     int64_t wallpaper_idle_since_us_ = 0;

@@ -1069,6 +1069,7 @@ idf_component_register(SRCS ${SOURCES}
                         spi_flash
                         console
                         efuse
+                        esp_http_server
                         bt
                         fatfs
                         ${MAIN_PRIV_REQUIRES_EXTRA}
