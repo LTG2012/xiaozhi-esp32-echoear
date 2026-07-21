@@ -236,6 +236,8 @@ SdMusicPlayer::UiSnapshot SdMusicPlayer::GetUiSnapshot() const {
     snapshot.library_ready = scanned_ && !scanning_;
     snapshot.library_error = library_error_;
     snapshot.current_index = current_index_;
+    snapshot.library_revision = library_revision_;
+    snapshot.state_revision = state_revision_;
     snapshot.state = state_ == State::kPlaying ? UiState::kPlaying
                      : state_ == State::kPaused ? UiState::kPaused
                                                 : UiState::kStopped;
@@ -296,6 +298,10 @@ std::string SdMusicPlayer::PlayNext() {
     return Control("next");
 }
 
+std::string SdMusicPlayer::Stop() {
+    return Control("stop");
+}
+
 void SdMusicPlayer::RequestLibraryRefresh() {
     Application::GetInstance().Schedule([this]() {
         {
@@ -306,6 +312,7 @@ void SdMusicPlayer::RequestLibraryRefresh() {
             scanned_ = false;
             scanning_ = true;
             library_error_.clear();
+            ++library_revision_;
         }
         (void)EnsureLibrary();
     });
@@ -407,6 +414,7 @@ void SdMusicPlayer::WorkerTask() {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (generation == generation_) {
                     state_ = State::kStopped;
+                    ++state_revision_;
                     auto_paused_ = false;
                 }
             }
@@ -772,6 +780,7 @@ std::string SdMusicPlayer::EnsureLibrary() {
         std::lock_guard<std::mutex> lock(mutex_);
         scanning_ = false;
         library_error_ = mount_error;
+        ++library_revision_;
         return mount_error;
     }
 
@@ -793,6 +802,7 @@ std::string SdMusicPlayer::EnsureLibrary() {
                 std::lock_guard<std::mutex> lock(mutex_);
                 scanning_ = false;
                 library_error_ = error;
+                ++library_revision_;
                 return error;
             }
         }
@@ -802,6 +812,7 @@ std::string SdMusicPlayer::EnsureLibrary() {
         if (songs_.empty()) {
             library_error_ = "SD卡已挂载，但/music及根目录中没有找到MP3歌曲。";
             scanning_ = false;
+            ++library_revision_;
             return library_error_;
         }
         library_error_.clear();
@@ -829,6 +840,7 @@ bool SdMusicPlayer::ScanLibrary(std::string& error) {
     scanned_ = true;
     scanning_ = false;
     library_error_ = error;
+    ++library_revision_;
     ESP_LOGI(kTag, "SD music scan found %u song(s)",
              static_cast<unsigned>(songs_.size()));
     return error.empty();
@@ -877,6 +889,7 @@ void SdMusicPlayer::MarkCardUnavailable() {
         std::lock_guard<std::mutex> lock(mutex_);
         scanned_ = false;
         scanning_ = false;
+        ++library_revision_;
     }
     SdCardManager::GetInstance().MarkUnavailable();
 }
@@ -932,6 +945,8 @@ std::string SdMusicPlayer::Control(const std::string& action_value) {
             state_ = State::kStopped;
             current_index_ = -1;
             scanned_ = false;
+            ++state_revision_;
+            ++library_revision_;
             playback_ui_task_pending_ = false;
             pending_playback_ui_generation_ = generation_;
         }
@@ -956,6 +971,7 @@ std::string SdMusicPlayer::Control(const std::string& action_value) {
                 return "当前没有正在播放的SD卡音乐。";
             }
             state_ = State::kPaused;
+            ++state_revision_;
             auto_paused_ = false;
             paused_generation = generation_;
             smoothed_music_level_ = 0;
@@ -975,6 +991,7 @@ std::string SdMusicPlayer::Control(const std::string& action_value) {
             return state_ == State::kPlaying ? "音乐已经在播放。" : "没有可继续的歌曲。";
         }
         state_ = State::kPlaying;
+        ++state_revision_;
         if (worker_task_ != nullptr) {
             xTaskNotifyGive(worker_task_);
         }
@@ -987,9 +1004,11 @@ std::string SdMusicPlayer::Control(const std::string& action_value) {
             ++generation_;
             state_ = State::kStopped;
             current_index_ = -1;
+            ++state_revision_;
             submitted_samples_ = 0;
             total_samples_ = 0;
             displayed_progress_permille_ = -1;
+            last_progress_ui_us_ = 0;
             next_playback_ui_sample_ = 0;
             smoothed_music_level_ = 0;
             std::fill(std::begin(music_level_history_), std::end(music_level_history_), 0);
@@ -1057,9 +1076,11 @@ void SdMusicPlayer::SelectTrackLocked(int index) {
     ++generation_;
     current_index_ = index;
     state_ = State::kPlaying;
+    ++state_revision_;
     submitted_samples_ = 0;
     total_samples_ = 0;
     displayed_progress_permille_ = -1;
+    last_progress_ui_us_ = 0;
     next_playback_ui_sample_ = 0;
     smoothed_music_level_ = 0;
     std::fill(std::begin(music_level_history_), std::end(music_level_history_), 0);
@@ -1264,6 +1285,7 @@ void SdMusicPlayer::UpdateLyrics(uint32_t generation) {
 
 void SdMusicPlayer::UpdateProgress(uint32_t generation, bool force) {
     static constexpr int kProgressUiStepPermille = 5;
+    static constexpr int64_t kProgressUiIntervalUs = 200 * 1000;
     int progress_permille = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1272,11 +1294,13 @@ void SdMusicPlayer::UpdateProgress(uint32_t generation, bool force) {
         }
         progress_permille = static_cast<int>(std::min<uint64_t>(
             1000, submitted_samples_ * 1000ULL / total_samples_));
-        if (!force && displayed_progress_permille_ >= 0 && progress_permille < 1000 &&
-            progress_permille - displayed_progress_permille_ < kProgressUiStepPermille) {
-            return;
+        if (!force && displayed_progress_permille_ >= 0 && progress_permille < 1000) {
+            const int64_t now_us = esp_timer_get_time();
+            if (progress_permille - displayed_progress_permille_ < kProgressUiStepPermille ||
+                now_us - last_progress_ui_us_ < kProgressUiIntervalUs) return;
         }
         displayed_progress_permille_ = progress_permille;
+        last_progress_ui_us_ = esp_timer_get_time();
     }
     // Rendering the transparent 360x185 arc can occasionally take longer than
     // the ~80 ms local-music PCM queue. Keep it off the decoder task so display
@@ -1383,6 +1407,7 @@ size_t SdMusicPlayer::ClearQueuedMusic() {
         submitted_samples_ = cleared >= submitted_samples_ ? 0 : submitted_samples_ - cleared;
         displayed_lyric_index_ = -1;
         displayed_progress_permille_ = -1;
+        last_progress_ui_us_ = 0;
     }
     return cleared;
 }

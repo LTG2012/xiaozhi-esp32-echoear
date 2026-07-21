@@ -45,11 +45,14 @@ public:
     bool ShowMediaTransferQr(const char* url);
     void HideMediaTransferQr();
 
-    void ShowTouchMenu(int reveal_height = 360);
+    void ShowTouchMenu(int reveal_height = 360, const char* volume = nullptr,
+                       const char* brightness = nullptr, const char* wallpaper = nullptr,
+                       const char* music = nullptr);
     void ShowTouchSlider(const char* title, int value);
+    void UpdateTouchSliderValue(int value);
     bool ShowTouchWallpaper(int index);
     void ShowTouchMusic(const std::vector<std::string>& titles, int first_index,
-                        int selected_index, const char* status);
+                        int selected_index, const char* status, const char* primary_control);
     void ShowTouchMusicPlayback();
     void HideTouchSettings();
     int GetTouchWallpaperCount();
@@ -78,7 +81,9 @@ private:
     gfx_obj_t* music_time_ = nullptr;
     gfx_image_dsc_t music_time_image_ = {};
     std::vector<uint8_t> music_time_image_data_;
-    gfx_obj_t* music_rhythm_bars_[6] = {};
+    gfx_obj_t* music_rhythm_ = nullptr;
+    gfx_image_dsc_t music_rhythm_image_ = {};
+    std::vector<uint8_t> music_rhythm_image_data_;
     gfx_obj_t* music_progress_ = nullptr;
     gfx_image_dsc_t music_progress_image_ = {};
     std::vector<uint8_t> music_progress_image_data_;
@@ -106,7 +111,8 @@ private:
     gfx_image_dsc_t wallpaper_image_dsc_ = {};
     std::mutex wallpaper_data_mutex_;
     std::vector<std::string> custom_wallpaper_paths_;
-    std::vector<uint8_t> custom_wallpaper_pixels_;
+    std::array<std::vector<uint8_t>, 2> custom_wallpaper_pixels_;
+    size_t custom_wallpaper_buffer_index_ = 0;
     esp_timer_handle_t wallpaper_timer_ = nullptr;
     bool wallpaper_idle_ = false;
     bool wallpaper_music_active_ = false;
@@ -127,6 +133,7 @@ private:
     static constexpr size_t kTouchRowCount = 5;
     static constexpr size_t kTouchControlCount = 3;
     gfx_obj_t* touch_background_ = nullptr;
+    gfx_obj_t* touch_glow_ = nullptr;
     gfx_obj_t* touch_wallpaper_image_ = nullptr;
     gfx_obj_t* touch_title_ = nullptr;
     gfx_obj_t* touch_back_ = nullptr;
@@ -142,12 +149,22 @@ private:
     bool touch_music_overlay_suppressed_ = false;
     bool touch_wallpaper_preview_ = false;
     bool touch_wallpaper_restore_visible_ = false;
+    enum class TouchView { kNone, kMenu, kSlider, kWallpaper, kMusic, kPlayback };
+    TouchView touch_view_ = TouchView::kNone;
+    int touch_menu_offset_ = 1;
+    int touch_slider_value_ = -1;
+    std::string touch_slider_title_;
+    std::array<std::string, kTouchRowCount> touch_row_text_;
+    std::array<bool, kTouchRowCount> touch_row_visible_ = {};
+    std::string touch_primary_control_;
 
     bool EnsureMusicUi();
     gfx_font_t EnsureCommonTextFont();
     bool InitializeMusicTimeImage();
     void RenderMusicTimeImage(const std::string& text);
     bool InitializeMusicProgressImage();
+    bool InitializeMusicRhythmImage();
+    void RenderMusicRhythmImage(int level_0, int level_1, int level_2);
     void SetMusicOverlayVisible(bool visible);
 
     static void WallpaperTimerCallback(void* arg);
@@ -167,6 +184,7 @@ private:
     void SaveWallpaperSettings();
     bool EnsureTouchSettingsUi();
     void HideTouchObjects();
+    void UpdateTouchMenuOffset(int reveal_height);
     void RestoreTouchWallpaperPreview();
 
 };

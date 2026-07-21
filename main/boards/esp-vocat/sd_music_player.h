@@ -23,6 +23,8 @@ public:
         std::vector<std::string> titles;
         UiState state = UiState::kStopped;
         int current_index = -1;
+        uint32_t library_revision = 0;
+        uint32_t state_revision = 0;
     };
 
     SdMusicPlayer();
@@ -36,6 +38,7 @@ public:
     std::string TogglePauseResume();
     std::string PlayPrevious();
     std::string PlayNext();
+    std::string Stop();
 
 private:
     struct Song {
@@ -73,9 +76,12 @@ private:
     State state_ = State::kStopped;
     int current_index_ = -1;
     uint32_t generation_ = 0;
+    uint32_t library_revision_ = 1;
+    uint32_t state_revision_ = 1;
     uint64_t submitted_samples_ = 0;
     uint64_t total_samples_ = 0;
     int displayed_progress_permille_ = -1;
+    int64_t last_progress_ui_us_ = 0;
     uint64_t next_playback_ui_sample_ = 0;
     int smoothed_music_level_ = 0;
     int music_level_history_[3] = {};

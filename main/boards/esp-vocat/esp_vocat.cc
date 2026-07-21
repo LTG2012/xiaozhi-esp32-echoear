@@ -18,6 +18,7 @@
 #include "esp_idf_version.h"
 #include <cinttypes>
 #include <algorithm>
+#include <atomic>
 #include <memory>
 
 #include <driver/i2c_master.h>
@@ -432,6 +433,7 @@ private:
     };
     TouchPage touch_page_ = TouchPage::kHidden;
     bool screen_touch_down_ = false;
+    std::atomic<bool> touch_ui_busy_{false};
     bool suppress_screen_release_ = false;
     bool slider_dragging_ = false;
     int touch_start_x_ = 0;
@@ -444,6 +446,12 @@ private:
     int music_first_index_ = 0;
     int music_selected_index_ = -1;
     int64_t music_ui_refresh_us_ = 0;
+    int64_t touch_render_us_ = 0;
+    uint32_t music_library_revision_ = 0;
+    uint32_t music_state_revision_ = 0;
+    int rendered_music_first_index_ = -1;
+    int rendered_music_selected_index_ = -2;
+    std::array<std::string, 4> touch_menu_status_;
 
     static void emotion_reset_timer_callback(void* arg)
     {
@@ -573,12 +581,12 @@ private:
     {
         auto* self = static_cast<EspVocat*>(arg);
         while (true) {
-            if (self != nullptr && self->charge_ != nullptr) {
+            if (self != nullptr && self->charge_ != nullptr && !self->touch_ui_busy_.load()) {
                 if (self->charge_->Update()) {
                     self->HandleBatteryEmotions();
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(300));
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 
@@ -598,7 +606,13 @@ private:
         constexpr int64_t kShakeCooldownMs = 2000;
 
         while (true) {
-            if (Bmi270Motion::ReadAccelRaw(cur)) {
+            if (self->touch_ui_busy_.load()) {
+                has_prev = false;
+                vTaskDelay(pdMS_TO_TICKS(80));
+                continue;
+            }
+            const bool read_ok = Bmi270Motion::ReadAccelRaw(cur);
+            if (read_ok) {
                 if (has_prev) {
                     int dx = abs(static_cast<int>(cur.acc.x) - static_cast<int>(prev.acc.x));
                     int dy = abs(static_cast<int>(cur.acc.y) - static_cast<int>(prev.acc.y));
@@ -615,7 +629,7 @@ private:
                 prev = cur;
                 has_prev = true;
             }
-            vTaskDelay(pdMS_TO_TICKS(80));
+            vTaskDelay(pdMS_TO_TICKS(read_ok ? 80 : 250));
         }
     }
 
@@ -741,7 +755,7 @@ private:
         }
     }
 
-    void RenderMusicPage()
+    void RenderMusicPage(bool force = false)
     {
         auto* emote_display = TouchDisplay();
         if (!emote_display || !music_player_) return;
@@ -756,11 +770,23 @@ private:
         }
         const int max_first = std::max(0, static_cast<int>(snapshot.titles.size()) - 5);
         music_first_index_ = std::clamp(music_first_index_, 0, max_first);
+        if (!force && snapshot.library_revision == music_library_revision_ &&
+            snapshot.state_revision == music_state_revision_ &&
+            music_first_index_ == rendered_music_first_index_ &&
+            music_selected_index_ == rendered_music_selected_index_) {
+            return;
+        }
         const char* status = snapshot.library_ready ? "暂无歌曲"
                              : snapshot.library_error.empty() ? "正在读取音乐列表…"
                                                               : snapshot.library_error.c_str();
+        const char* primary_control = snapshot.state == SdMusicPlayer::UiState::kPlaying
+            ? "停止" : snapshot.state == SdMusicPlayer::UiState::kPaused ? "继续" : "播放";
         emote_display->ShowTouchMusic(snapshot.titles, music_first_index_,
-                                      music_selected_index_, status);
+                                      music_selected_index_, status, primary_control);
+        music_library_revision_ = snapshot.library_revision;
+        music_state_revision_ = snapshot.state_revision;
+        rendered_music_first_index_ = music_first_index_;
+        rendered_music_selected_index_ = music_selected_index_;
         music_ui_refresh_us_ = esp_timer_get_time();
     }
 
@@ -771,14 +797,43 @@ private:
             emote_display->HideTouchSettings();
         }
         touch_page_ = TouchPage::kHidden;
+        touch_ui_busy_.store(false);
         slider_dragging_ = false;
     }
 
     void ShowTouchMenu(int reveal_height = DISPLAY_HEIGHT)
     {
         if (auto* emote_display = TouchDisplay()) {
-            emote_display->ShowTouchMenu(reveal_height);
+            if (touch_page_ != TouchPage::kMenu && touch_page_ != TouchPage::kPulling) {
+                touch_menu_status_[0] = std::to_string(GetAudioCodec()->output_volume()) + "%";
+                touch_menu_status_[1] = std::to_string(backlight_ ? backlight_->brightness() : 75) + "%";
+                touch_menu_status_[2] = emote_display->GetTouchWallpaperName(
+                    emote_display->GetTouchWallpaperIndex());
+                touch_menu_status_[3] = "未播放";
+                if (music_player_) {
+                    const auto snapshot = music_player_->GetUiSnapshot();
+                    const int index = snapshot.current_index >= 0 ? snapshot.current_index : music_selected_index_;
+                    if (index >= 0 && index < static_cast<int>(snapshot.titles.size()))
+                        touch_menu_status_[3] = snapshot.titles[index];
+                }
+            }
+            emote_display->ShowTouchMenu(reveal_height, touch_menu_status_[0].c_str(),
+                                         touch_menu_status_[1].c_str(), touch_menu_status_[2].c_str(),
+                                         touch_menu_status_[3].c_str());
             touch_page_ = reveal_height >= DISPLAY_HEIGHT ? TouchPage::kMenu : TouchPage::kPulling;
+            touch_ui_busy_.store(true);
+        }
+    }
+
+    void AnimateTouchMenu(int start_height, int end_height)
+    {
+        constexpr int kFrames = 6;
+        for (int frame = 1; frame <= kFrames; ++frame) {
+            const float t = static_cast<float>(frame) / kFrames;
+            const float remaining = 1.0f - t;
+            const float eased = 1.0f - remaining * remaining * remaining;
+            ShowTouchMenu(static_cast<int>(start_height + (end_height - start_height) * eased));
+            if (frame != kFrames) vTaskDelay(pdMS_TO_TICKS(30));
         }
     }
 
@@ -807,7 +862,7 @@ private:
             music_selected_index_ = snapshot.current_index;
             music_first_index_ = std::max(0, music_selected_index_ - 2);
             music_player_->RequestLibraryRefresh();
-            RenderMusicPage();
+            RenderMusicPage(true);
         }
     }
 
@@ -820,8 +875,11 @@ private:
         wallpaper_candidate_ = (wallpaper_candidate_ + direction + count) % count;
         const int candidate = wallpaper_candidate_;
         Application::GetInstance().Schedule([this, emote_display, candidate]() {
-            if (touch_page_ == TouchPage::kWallpaper) {
-                emote_display->ShowTouchWallpaper(candidate);
+            if (touch_page_ == TouchPage::kWallpaper && candidate == wallpaper_candidate_) {
+                const int64_t started_us = esp_timer_get_time();
+                const bool shown = emote_display->ShowTouchWallpaper(candidate);
+                ESP_LOGI(TAG, "Wallpaper preview index=%d shown=%d decode=%lldms",
+                         candidate, shown, (esp_timer_get_time() - started_us) / 1000);
             }
         });
     }
@@ -836,6 +894,7 @@ private:
 
         if (pressed && !screen_touch_down_) {
             screen_touch_down_ = true;
+            touch_ui_busy_.store(true);
             slider_dragging_ = false;
             touch_start_x_ = touch_last_x_ = x;
             touch_start_y_ = touch_last_y_ = y;
@@ -846,9 +905,7 @@ private:
                 slider_dragging_ = true;
                 touch_value_ = SliderValueFromX(x);
                 if (auto* emote_display = TouchDisplay()) {
-                    emote_display->ShowTouchSlider(
-                        touch_page_ == TouchPage::kVolume ? "音量调节" : "亮度调节",
-                        touch_value_);
+                    emote_display->UpdateTouchSliderValue(touch_value_);
                 }
                 if (touch_page_ == TouchPage::kBrightness && backlight_) {
                     backlight_->SetBrightness(touch_value_, false);
@@ -860,27 +917,31 @@ private:
         if (pressed && screen_touch_down_) {
             touch_last_x_ = x;
             touch_last_y_ = y;
+            const int64_t now_us = esp_timer_get_time();
+            const bool render_frame = now_us - touch_render_us_ >= 33 * 1000;
             if (touch_page_ == TouchPage::kHidden && touch_start_y_ <= 30 &&
                 app.GetDeviceState() == kDeviceStateIdle && y > touch_start_y_) {
-                ShowTouchMenu(y - touch_start_y_);
+                if (render_frame) ShowTouchMenu(y - touch_start_y_);
             } else if (touch_page_ == TouchPage::kPulling) {
-                ShowTouchMenu(y - touch_start_y_);
+                if (render_frame) ShowTouchMenu(y - touch_start_y_);
             } else if (slider_dragging_) {
                 touch_value_ = SliderValueFromX(x);
-                if (auto* emote_display = TouchDisplay()) {
-                    emote_display->ShowTouchSlider(
-                        touch_page_ == TouchPage::kVolume ? "音量调节" : "亮度调节",
-                        touch_value_);
+                if (render_frame) {
+                    if (auto* emote_display = TouchDisplay()) {
+                        emote_display->UpdateTouchSliderValue(touch_value_);
+                    }
                 }
                 if (touch_page_ == TouchPage::kBrightness && backlight_) {
                     backlight_->SetBrightness(touch_value_, false);
                 }
             }
+            if (render_frame) touch_render_us_ = now_us;
             return;
         }
 
         if (pressed || !screen_touch_down_) return;
         screen_touch_down_ = false;
+        if (touch_page_ == TouchPage::kHidden) touch_ui_busy_.store(false);
         if (suppress_screen_release_) {
             suppress_screen_release_ = false;
             return;
@@ -906,11 +967,18 @@ private:
             return;
         }
         if (touch_page_ == TouchPage::kPulling) {
-            if (dy >= 110) ShowTouchMenu(); else CloseTouchSettings();
+            const int current_height = std::clamp(dy, 0, DISPLAY_HEIGHT);
+            if (dy >= 110) {
+                AnimateTouchMenu(current_height, DISPLAY_HEIGHT);
+            } else {
+                AnimateTouchMenu(current_height, 0);
+                CloseTouchSettings();
+            }
             return;
         }
         if (touch_page_ == TouchPage::kMenu) {
             if (dy < -60 || (tap && touch_start_x_ >= 220 && touch_start_y_ <= 100)) {
+                AnimateTouchMenu(DISPLAY_HEIGHT, 0);
                 CloseTouchSettings();
                 return;
             }
@@ -926,7 +994,7 @@ private:
         if (touch_page_ == TouchPage::kMusicPlayback && (back_tap || back_swipe)) {
             ESP_LOGI(TAG, "Touch music playback return to list");
             touch_page_ = TouchPage::kMusic;
-            RenderMusicPage();
+            RenderMusicPage(true);
             return;
         }
         if (back_tap || back_swipe) {
@@ -1003,6 +1071,13 @@ private:
                     music_selected_index_ >= static_cast<int>(snapshot.titles.size())) {
                     return;
                 }
+                if (snapshot.state == SdMusicPlayer::UiState::kPlaying) {
+                    ESP_LOGI(TAG, "Touch music stop playback");
+                    Application::GetInstance().Schedule([this]() {
+                        music_player_->Stop();
+                    });
+                    return;
+                }
                 const int selected = music_selected_index_;
                 touch_page_ = TouchPage::kMusicPlayback;
                 if (auto* emote_display = TouchDisplay()) {
@@ -1028,7 +1103,7 @@ private:
         while (self && self->tp_) {
             bool should_read = self->screen_touch_down_;
             if (should_read) {
-                vTaskDelay(pdMS_TO_TICKS(20));
+                vTaskDelay(pdMS_TO_TICKS(16));
             } else {
                 should_read = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20)) > 0;
             }
@@ -1041,10 +1116,10 @@ private:
                 }
             }
             if (self->touch_page_ == TouchPage::kMusic &&
-                esp_timer_get_time() - self->music_ui_refresh_us_ >= 500 * 1000) {
+                esp_timer_get_time() - self->music_ui_refresh_us_ >= 250 * 1000) {
                 self->RenderMusicPage();
             }
-            vTaskDelay(pdMS_TO_TICKS(20));
+            if (!self->screen_touch_down_) vTaskDelay(pdMS_TO_TICKS(4));
         }
         vTaskDelete(nullptr);
     }
