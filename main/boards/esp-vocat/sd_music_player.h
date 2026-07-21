@@ -11,12 +11,31 @@
 #include <freertos/task.h>
 class SdMusicPlayer {
 public:
+    enum class UiState {
+        kStopped,
+        kPlaying,
+        kPaused,
+    };
+
+    struct UiSnapshot {
+        bool library_ready = false;
+        std::string library_error;
+        std::vector<std::string> titles;
+        UiState state = UiState::kStopped;
+        int current_index = -1;
+    };
+
     SdMusicPlayer();
     ~SdMusicPlayer();
 
     void RegisterMcpTools();
     bool IsActive() const;
     void RequestLibraryRefresh();
+    UiSnapshot GetUiSnapshot() const;
+    std::string PlayIndex(int index);
+    std::string TogglePauseResume();
+    std::string PlayPrevious();
+    std::string PlayNext();
 
 private:
     struct Song {
@@ -49,6 +68,8 @@ private:
     mutable std::mutex mutex_;
     std::vector<Song> songs_;
     bool scanned_ = false;
+    bool scanning_ = false;
+    std::string library_error_;
     State state_ = State::kStopped;
     int current_index_ = -1;
     uint32_t generation_ = 0;

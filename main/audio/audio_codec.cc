@@ -29,9 +29,9 @@ bool AudioCodec::InputData(std::vector<int16_t>& data) {
 void AudioCodec::Start() {
     Settings settings("audio", false);
     output_volume_ = settings.GetInt("output_volume", output_volume_);
-    if (output_volume_ <= 0) {
-        ESP_LOGW(TAG, "Output volume value (%d) is too small, setting to default (10)", output_volume_);
-        output_volume_ = 10;
+    if (output_volume_ < 0 || output_volume_ > 100) {
+        ESP_LOGW(TAG, "Output volume value (%d) is invalid, setting to default (70)", output_volume_);
+        output_volume_ = 70;
     }
 
     ESP_LOGI(TAG, "Audio codec started");

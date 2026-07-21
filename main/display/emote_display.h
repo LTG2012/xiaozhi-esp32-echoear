@@ -2,6 +2,7 @@
 
 #include "display.h"
 #include <atomic>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,6 +44,18 @@ public:
     void RequestCustomWallpaperRefresh();
     bool ShowMediaTransferQr(const char* url);
     void HideMediaTransferQr();
+
+    void ShowTouchMenu(int reveal_height = 360);
+    void ShowTouchSlider(const char* title, int value);
+    bool ShowTouchWallpaper(int index);
+    void ShowTouchMusic(const std::vector<std::string>& titles, int first_index,
+                        int selected_index, const char* status);
+    void ShowTouchMusicPlayback();
+    void HideTouchSettings();
+    int GetTouchWallpaperCount();
+    int GetTouchWallpaperIndex() const { return wallpaper_index_; }
+    std::string GetTouchWallpaperName(int index);
+    bool ApplyTouchWallpaper(int index);
 
     void RefreshAll();
 
@@ -111,10 +124,31 @@ private:
     int wallpaper_high_c_ = kWallpaperUnsetTemperature;
     int wallpaper_low_c_ = kWallpaperUnsetTemperature;
 
+    static constexpr size_t kTouchRowCount = 5;
+    static constexpr size_t kTouchControlCount = 3;
+    gfx_obj_t* touch_background_ = nullptr;
+    gfx_obj_t* touch_wallpaper_image_ = nullptr;
+    gfx_obj_t* touch_title_ = nullptr;
+    gfx_obj_t* touch_back_ = nullptr;
+    gfx_obj_t* touch_close_ = nullptr;
+    std::array<gfx_obj_t*, kTouchRowCount> touch_rows_ = {};
+    gfx_obj_t* touch_footer_ = nullptr;
+    gfx_obj_t* touch_slider_track_ = nullptr;
+    gfx_obj_t* touch_slider_fill_ = nullptr;
+    gfx_obj_t* touch_slider_knob_ = nullptr;
+    gfx_obj_t* touch_music_return_ = nullptr;
+    std::array<gfx_obj_t*, kTouchControlCount> touch_controls_ = {};
+    bool touch_settings_visible_ = false;
+    bool touch_music_overlay_suppressed_ = false;
+    bool touch_wallpaper_preview_ = false;
+    bool touch_wallpaper_restore_visible_ = false;
+
     bool EnsureMusicUi();
+    gfx_font_t EnsureCommonTextFont();
     bool InitializeMusicTimeImage();
     void RenderMusicTimeImage(const std::string& text);
     bool InitializeMusicProgressImage();
+    void SetMusicOverlayVisible(bool visible);
 
     static void WallpaperTimerCallback(void* arg);
     bool EnsureWallpaperUi();
@@ -131,6 +165,9 @@ private:
     void CacheWeatherFromAssistantMessage(const char* content);
     void LoadWallpaperSettings();
     void SaveWallpaperSettings();
+    bool EnsureTouchSettingsUi();
+    void HideTouchObjects();
+    void RestoreTouchWallpaperPreview();
 
 };
 

@@ -17,6 +17,7 @@
 #include <esp_timer.h>
 #include "esp_idf_version.h"
 #include <cinttypes>
+#include <algorithm>
 #include <memory>
 
 #include <driver/i2c_master.h>
@@ -36,7 +37,6 @@ extern "C" {
 
 #include "driver/temperature_sensor.h"
 #include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 #include <freertos/task.h>
 
 #define TAG "ESP-VoCat"
@@ -385,157 +385,17 @@ private:
     uint32_t temperature_fail_count_ = 0;
 };
 
-class Cst816s : public I2cDevice {
-public:
-    struct TouchPoint_t {
-        int num = 0;
-        int x = -1;
-        int y = -1;
-    };
-
-    enum TouchEvent {
-        TOUCH_NONE,
-        TOUCH_PRESS,
-        TOUCH_RELEASE,
-        TOUCH_HOLD
-    };
-
-    Cst816s(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr)
-    {
-        read_buffer_ = new uint8_t[6];
-        was_touched_ = false;
-        press_count_ = 0;
-
-        // Create touch interrupt semaphore
-        touch_isr_mux_ = xSemaphoreCreateBinary();
-        if (touch_isr_mux_ == NULL) {
-            ESP_LOGE(TAG, "Failed to create touch semaphore");
-        }
-    }
-
-    ~Cst816s()
-    {
-        delete[] read_buffer_;
-
-        // Delete semaphore if it exists
-        if (touch_isr_mux_ != NULL) {
-            vSemaphoreDelete(touch_isr_mux_);
-            touch_isr_mux_ = NULL;
-        }
-    }
-
-    bool UpdateTouchPoint()
-    {
-        const esp_err_t ret = TryReadRegs(0x02, read_buffer_, 6);
-        if (ret != ESP_OK) {
-            ++read_fail_count_;
-            if (read_fail_count_ == 1 || (read_fail_count_ % 30) == 0) {
-                ESP_LOGW(TAG, "Touch read failed: %s (fail_count=%lu)",
-                         esp_err_to_name(ret), static_cast<unsigned long>(read_fail_count_));
-            }
-            tp_.num = 0;
-            tp_.x = -1;
-            tp_.y = -1;
-            return false;
-        }
-
-        if (read_fail_count_ > 0) {
-            ESP_LOGI(TAG, "Touch I2C recovered after %lu failures", static_cast<unsigned long>(read_fail_count_));
-            read_fail_count_ = 0;
-        }
-        tp_.num = read_buffer_[0] & 0x0F;
-        tp_.x = ((read_buffer_[1] & 0x0F) << 8) | read_buffer_[2];
-        tp_.y = ((read_buffer_[3] & 0x0F) << 8) | read_buffer_[4];
-        return true;
-    }
-
-    const TouchPoint_t &GetTouchPoint()
-    {
-        return tp_;
-    }
-
-    TouchEvent CheckTouchEvent()
-    {
-        bool is_touched = (tp_.num > 0);
-        TouchEvent event = TOUCH_NONE;
-
-        if (is_touched && !was_touched_) {
-            // Press event (transition from not touched to touched)
-            press_count_++;
-            event = TOUCH_PRESS;
-            ESP_LOGI(TAG, "TOUCH PRESS - count: %d, x: %d, y: %d", press_count_, tp_.x, tp_.y);
-        } else if (!is_touched && was_touched_) {
-            // Release event (transition from touched to not touched)
-            event = TOUCH_RELEASE;
-            ESP_LOGI(TAG, "TOUCH RELEASE - total presses: %d", press_count_);
-        } else if (is_touched && was_touched_) {
-            // Continuous touch (hold)
-            event = TOUCH_HOLD;
-            ESP_LOGD(TAG, "TOUCH HOLD - x: %d, y: %d", tp_.x, tp_.y);
-        }
-
-        // Update previous state
-        was_touched_ = is_touched;
-        return event;
-    }
-
-    int GetPressCount() const
-    {
-        return press_count_;
-    }
-
-    void ResetPressCount()
-    {
-        press_count_ = 0;
-    }
-
-    // Semaphore management methods
-    SemaphoreHandle_t GetTouchSemaphore()
-    {
-        return touch_isr_mux_;
-    }
-
-    bool WaitForTouchEvent(TickType_t timeout = portMAX_DELAY)
-    {
-        if (touch_isr_mux_ != NULL) {
-            return xSemaphoreTake(touch_isr_mux_, timeout) == pdTRUE;
-        }
-        return false;
-    }
-
-    void NotifyTouchEvent()
-    {
-        if (touch_isr_mux_ != NULL) {
-            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-            xSemaphoreGiveFromISR(touch_isr_mux_, &xHigherPriorityTaskWoken);
-            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-        }
-    }
-
-private:
-    uint8_t* read_buffer_ = nullptr;
-    TouchPoint_t tp_;
-
-    // Touch state tracking
-    bool was_touched_;
-    int press_count_;
-
-    // Touch interrupt semaphore
-    SemaphoreHandle_t touch_isr_mux_;
-    uint32_t read_fail_count_ = 0;
-};
-
 class EspVocat : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_ = nullptr;
     i2c_bus_handle_t shared_i2c_bus_handle_ = nullptr;
-    Cst816s* cst816s_ = nullptr;
     Charge* charge_ = nullptr;
     Button boot_button_;
     Display* display_ = nullptr;
     PwmBacklight* backlight_ = nullptr;
     esp_timer_handle_t touchpad_timer_;
-    esp_lcd_touch_handle_t tp;   // LCD touch handle
+    esp_lcd_panel_io_handle_t touch_io_ = nullptr;
+    esp_lcd_touch_handle_t tp_ = nullptr;
     EspVideo* camera_ = nullptr;
     TaskHandle_t charge_task_handle_ = nullptr;
     TaskHandle_t touch_task_handle_ = nullptr;
@@ -559,6 +419,31 @@ private:
     bool touch_swipe_detected_ = false;
     std::unique_ptr<SdMusicPlayer> music_player_;
     std::unique_ptr<MediaTransferServer> media_transfer_;
+
+    enum class TouchPage {
+        kHidden,
+        kPulling,
+        kMenu,
+        kVolume,
+        kBrightness,
+        kWallpaper,
+        kMusic,
+        kMusicPlayback,
+    };
+    TouchPage touch_page_ = TouchPage::kHidden;
+    bool screen_touch_down_ = false;
+    bool suppress_screen_release_ = false;
+    bool slider_dragging_ = false;
+    int touch_start_x_ = 0;
+    int touch_start_y_ = 0;
+    int touch_last_x_ = 0;
+    int touch_last_y_ = 0;
+    int64_t screen_touch_start_us_ = 0;
+    int touch_value_ = 0;
+    int wallpaper_candidate_ = 0;
+    int music_first_index_ = 0;
+    int music_selected_index_ = -1;
+    int64_t music_ui_refresh_us_ = 0;
 
     static void emotion_reset_timer_callback(void* arg)
     {
@@ -821,43 +706,347 @@ private:
         return false;
     }
 
-    static void touch_isr_callback(void* arg)
+    emote::EmoteDisplay* TouchDisplay()
     {
-        Cst816s* touchpad = static_cast<Cst816s*>(arg);
-        if (touchpad != nullptr) {
-            touchpad->NotifyTouchEvent();
+        return dynamic_cast<emote::EmoteDisplay*>(display_);
+    }
+
+    static int SliderValueFromX(int x)
+    {
+        return std::clamp((x - 45) * 100 / 270, 0, 100);
+    }
+
+    static const char* TouchPageName(TouchPage page)
+    {
+        switch (page) {
+            case TouchPage::kHidden: return "hidden";
+            case TouchPage::kPulling: return "pulling";
+            case TouchPage::kMenu: return "menu";
+            case TouchPage::kVolume: return "volume";
+            case TouchPage::kBrightness: return "brightness";
+            case TouchPage::kWallpaper: return "wallpaper";
+            case TouchPage::kMusic: return "music";
+            case TouchPage::kMusicPlayback: return "music_playback";
+        }
+        return "unknown";
+    }
+
+    static void TouchInterruptCallback(esp_lcd_touch_handle_t touch)
+    {
+        auto* self = touch ? static_cast<EspVocat*>(touch->config.user_data) : nullptr;
+        if (self && self->touch_task_handle_) {
+            BaseType_t higher_priority_task_woken = pdFALSE;
+            vTaskNotifyGiveFromISR(self->touch_task_handle_, &higher_priority_task_woken);
+            portYIELD_FROM_ISR(higher_priority_task_woken);
+        }
+    }
+
+    void RenderMusicPage()
+    {
+        auto* emote_display = TouchDisplay();
+        if (!emote_display || !music_player_) return;
+        const auto snapshot = music_player_->GetUiSnapshot();
+        if (snapshot.titles.empty()) {
+            music_selected_index_ = -1;
+        } else if (music_selected_index_ < 0 ||
+                   music_selected_index_ >= static_cast<int>(snapshot.titles.size())) {
+            music_selected_index_ = snapshot.current_index >= 0
+                ? snapshot.current_index : 0;
+            music_first_index_ = std::max(0, music_selected_index_ - 2);
+        }
+        const int max_first = std::max(0, static_cast<int>(snapshot.titles.size()) - 5);
+        music_first_index_ = std::clamp(music_first_index_, 0, max_first);
+        const char* status = snapshot.library_ready ? "暂无歌曲"
+                             : snapshot.library_error.empty() ? "正在读取音乐列表…"
+                                                              : snapshot.library_error.c_str();
+        emote_display->ShowTouchMusic(snapshot.titles, music_first_index_,
+                                      music_selected_index_, status);
+        music_ui_refresh_us_ = esp_timer_get_time();
+    }
+
+    void CloseTouchSettings()
+    {
+        ESP_LOGI(TAG, "Touch UI close from page=%s", TouchPageName(touch_page_));
+        if (auto* emote_display = TouchDisplay()) {
+            emote_display->HideTouchSettings();
+        }
+        touch_page_ = TouchPage::kHidden;
+        slider_dragging_ = false;
+    }
+
+    void ShowTouchMenu(int reveal_height = DISPLAY_HEIGHT)
+    {
+        if (auto* emote_display = TouchDisplay()) {
+            emote_display->ShowTouchMenu(reveal_height);
+            touch_page_ = reveal_height >= DISPLAY_HEIGHT ? TouchPage::kMenu : TouchPage::kPulling;
+        }
+    }
+
+    void OpenTouchPage(int row)
+    {
+        auto* emote_display = TouchDisplay();
+        if (!emote_display) return;
+        ESP_LOGI(TAG, "Touch UI menu select row=%d", row);
+        if (row == 0) {
+            touch_page_ = TouchPage::kVolume;
+            touch_value_ = GetAudioCodec()->output_volume();
+            emote_display->ShowTouchSlider("音量调节", touch_value_);
+        } else if (row == 1) {
+            touch_page_ = TouchPage::kBrightness;
+            touch_value_ = backlight_ ? backlight_->brightness() : 75;
+            emote_display->ShowTouchSlider("亮度调节", touch_value_);
+        } else if (row == 2) {
+            touch_page_ = TouchPage::kWallpaper;
+            const int count = emote_display->GetTouchWallpaperCount();
+            wallpaper_candidate_ = count > 0
+                ? std::clamp(emote_display->GetTouchWallpaperIndex(), 0, count - 1) : 0;
+            emote_display->ShowTouchWallpaper(wallpaper_candidate_);
+        } else if (row == 3) {
+            touch_page_ = TouchPage::kMusic;
+            const auto snapshot = music_player_->GetUiSnapshot();
+            music_selected_index_ = snapshot.current_index;
+            music_first_index_ = std::max(0, music_selected_index_ - 2);
+            music_player_->RequestLibraryRefresh();
+            RenderMusicPage();
+        }
+    }
+
+    void PreviewWallpaper(int direction)
+    {
+        auto* emote_display = TouchDisplay();
+        if (!emote_display) return;
+        const int count = emote_display->GetTouchWallpaperCount();
+        if (count <= 0) return;
+        wallpaper_candidate_ = (wallpaper_candidate_ + direction + count) % count;
+        const int candidate = wallpaper_candidate_;
+        Application::GetInstance().Schedule([this, emote_display, candidate]() {
+            if (touch_page_ == TouchPage::kWallpaper) {
+                emote_display->ShowTouchWallpaper(candidate);
+            }
+        });
+    }
+
+    void HandleScreenTouch(bool pressed, int x, int y)
+    {
+        auto& app = Application::GetInstance();
+        if (touch_page_ != TouchPage::kHidden && app.GetDeviceState() != kDeviceStateIdle) {
+            suppress_screen_release_ = screen_touch_down_;
+            CloseTouchSettings();
+        }
+
+        if (pressed && !screen_touch_down_) {
+            screen_touch_down_ = true;
+            slider_dragging_ = false;
+            touch_start_x_ = touch_last_x_ = x;
+            touch_start_y_ = touch_last_y_ = y;
+            screen_touch_start_us_ = esp_timer_get_time();
+            ESP_LOGI(TAG, "Touch down page=%s x=%d y=%d", TouchPageName(touch_page_), x, y);
+            if ((touch_page_ == TouchPage::kVolume || touch_page_ == TouchPage::kBrightness) &&
+                y >= 155 && y <= 235) {
+                slider_dragging_ = true;
+                touch_value_ = SliderValueFromX(x);
+                if (auto* emote_display = TouchDisplay()) {
+                    emote_display->ShowTouchSlider(
+                        touch_page_ == TouchPage::kVolume ? "音量调节" : "亮度调节",
+                        touch_value_);
+                }
+                if (touch_page_ == TouchPage::kBrightness && backlight_) {
+                    backlight_->SetBrightness(touch_value_, false);
+                }
+            }
+            return;
+        }
+
+        if (pressed && screen_touch_down_) {
+            touch_last_x_ = x;
+            touch_last_y_ = y;
+            if (touch_page_ == TouchPage::kHidden && touch_start_y_ <= 30 &&
+                app.GetDeviceState() == kDeviceStateIdle && y > touch_start_y_) {
+                ShowTouchMenu(y - touch_start_y_);
+            } else if (touch_page_ == TouchPage::kPulling) {
+                ShowTouchMenu(y - touch_start_y_);
+            } else if (slider_dragging_) {
+                touch_value_ = SliderValueFromX(x);
+                if (auto* emote_display = TouchDisplay()) {
+                    emote_display->ShowTouchSlider(
+                        touch_page_ == TouchPage::kVolume ? "音量调节" : "亮度调节",
+                        touch_value_);
+                }
+                if (touch_page_ == TouchPage::kBrightness && backlight_) {
+                    backlight_->SetBrightness(touch_value_, false);
+                }
+            }
+            return;
+        }
+
+        if (pressed || !screen_touch_down_) return;
+        screen_touch_down_ = false;
+        if (suppress_screen_release_) {
+            suppress_screen_release_ = false;
+            return;
+        }
+        const int dx = touch_last_x_ - touch_start_x_;
+        const int dy = touch_last_y_ - touch_start_y_;
+        const int64_t duration_ms = (esp_timer_get_time() - screen_touch_start_us_) / 1000;
+        const bool tap = std::abs(dx) < 12 && std::abs(dy) < 12;
+        ESP_LOGI(TAG, "Touch up page=%s start=(%d,%d) end=(%d,%d) delta=(%d,%d) duration=%lldms tap=%d",
+                 TouchPageName(touch_page_), touch_start_x_, touch_start_y_,
+                 touch_last_x_, touch_last_y_, dx, dy, duration_ms, tap);
+
+        if (touch_page_ == TouchPage::kHidden) {
+            if (!tap || duration_ms > 800) {
+                ESP_LOGI(TAG, "Touch gesture ignored on hidden page");
+                return;
+            }
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                EnterWifiConfigMode();
+            } else {
+                app.ToggleChatState();
+            }
+            return;
+        }
+        if (touch_page_ == TouchPage::kPulling) {
+            if (dy >= 110) ShowTouchMenu(); else CloseTouchSettings();
+            return;
+        }
+        if (touch_page_ == TouchPage::kMenu) {
+            if (dy < -60 || (tap && touch_start_x_ >= 220 && touch_start_y_ <= 100)) {
+                CloseTouchSettings();
+                return;
+            }
+            if (tap && touch_start_x_ >= 45 && touch_start_x_ <= 315 &&
+                touch_start_y_ >= 78 && touch_start_y_ < 274) {
+                const int row = (touch_start_y_ - 82) / 48;
+                if (row >= 0 && row < 4) OpenTouchPage(row);
+            }
+            return;
+        }
+        const bool back_tap = tap && touch_start_x_ <= 150 && touch_start_y_ <= 108;
+        const bool back_swipe = touch_start_x_ <= 75 && dx >= 60 && std::abs(dx) > std::abs(dy);
+        if (touch_page_ == TouchPage::kMusicPlayback && (back_tap || back_swipe)) {
+            ESP_LOGI(TAG, "Touch music playback return to list");
+            touch_page_ = TouchPage::kMusic;
+            RenderMusicPage();
+            return;
+        }
+        if (back_tap || back_swipe) {
+            ShowTouchMenu();
+            return;
+        }
+        if (touch_page_ == TouchPage::kVolume || touch_page_ == TouchPage::kBrightness) {
+            if (slider_dragging_) {
+                const int value = touch_value_;
+                const bool volume = touch_page_ == TouchPage::kVolume;
+                ESP_LOGI(TAG, "Touch slider commit type=%s value=%d", volume ? "volume" : "brightness", value);
+                Application::GetInstance().Schedule([this, value, volume]() {
+                    if (volume) GetAudioCodec()->SetOutputVolume(value);
+                    else if (backlight_) backlight_->SetBrightness(value, true);
+                });
+            }
+            slider_dragging_ = false;
+            return;
+        }
+        if (touch_page_ == TouchPage::kWallpaper) {
+            if (std::abs(dx) >= 40 && std::abs(dx) > std::abs(dy)) {
+                ESP_LOGI(TAG, "Touch wallpaper browse direction=%s", dx < 0 ? "next" : "previous");
+                PreviewWallpaper(dx < 0 ? 1 : -1);
+            } else if (tap && touch_start_y_ >= 80 && touch_start_y_ <= 300) {
+                auto* emote_display = TouchDisplay();
+                const int candidate = wallpaper_candidate_;
+                ESP_LOGI(TAG, "Touch wallpaper apply index=%d", candidate);
+                Application::GetInstance().Schedule([this, emote_display, candidate]() {
+                    if (touch_page_ == TouchPage::kWallpaper && emote_display) {
+                        emote_display->ApplyTouchWallpaper(candidate);
+                    }
+                });
+            }
+            return;
+        }
+        if (touch_page_ == TouchPage::kMusic) {
+            if (std::abs(dy) >= 35 && std::abs(dy) > std::abs(dx)) {
+                const auto snapshot = music_player_->GetUiSnapshot();
+                const int max_first = std::max(0, static_cast<int>(snapshot.titles.size()) - 5);
+                music_first_index_ = std::clamp(music_first_index_ + (dy < 0 ? 1 : -1), 0, max_first);
+                ESP_LOGI(TAG, "Touch music scroll first=%d", music_first_index_);
+                RenderMusicPage();
+            } else if (tap && touch_start_y_ >= 78 && touch_start_y_ < 282) {
+                const int index = music_first_index_ + (touch_start_y_ - 80) / 40;
+                const auto snapshot = music_player_->GetUiSnapshot();
+                if (index >= 0 && index < static_cast<int>(snapshot.titles.size())) {
+                    ESP_LOGI(TAG, "Touch music select index=%d", index);
+                    music_selected_index_ = index;
+                    RenderMusicPage();
+                }
+            } else if (tap && touch_start_x_ >= 60 && touch_start_x_ <= 300 &&
+                       touch_start_y_ >= 280 && touch_start_y_ <= 332) {
+                const int control = std::clamp((touch_start_x_ - 66) / 76, 0, 2);
+                ESP_LOGI(TAG, "Touch music control=%d", control);
+                const auto snapshot = music_player_->GetUiSnapshot();
+                if (snapshot.titles.empty()) {
+                    return;
+                }
+                if (control == 0 || control == 2) {
+                    const int direction = control == 0 ? -1 : 1;
+                    music_selected_index_ = std::clamp(
+                        music_selected_index_ + direction, 0,
+                        static_cast<int>(snapshot.titles.size()) - 1);
+                    if (music_selected_index_ < music_first_index_) {
+                        music_first_index_ = music_selected_index_;
+                    } else if (music_selected_index_ >= music_first_index_ + 5) {
+                        music_first_index_ = music_selected_index_ - 4;
+                    }
+                    ESP_LOGI(TAG, "Touch music selection moved index=%d", music_selected_index_);
+                    RenderMusicPage();
+                    return;
+                }
+                if (music_selected_index_ < 0 ||
+                    music_selected_index_ >= static_cast<int>(snapshot.titles.size())) {
+                    return;
+                }
+                const int selected = music_selected_index_;
+                touch_page_ = TouchPage::kMusicPlayback;
+                if (auto* emote_display = TouchDisplay()) {
+                    emote_display->ShowTouchMusicPlayback();
+                }
+                ESP_LOGI(TAG, "Touch music play selected index=%d", selected);
+                Application::GetInstance().Schedule([this, selected]() {
+                    const auto current = music_player_->GetUiSnapshot();
+                    if (current.current_index != selected ||
+                        current.state == SdMusicPlayer::UiState::kStopped) {
+                        music_player_->PlayIndex(selected);
+                    } else if (current.state == SdMusicPlayer::UiState::kPaused) {
+                        music_player_->TogglePauseResume();
+                    }
+                });
+            }
         }
     }
 
     static void touch_event_task(void* arg)
     {
-        Cst816s* touchpad = static_cast<Cst816s*>(arg);
-        if (touchpad == nullptr) {
-            ESP_LOGE(TAG, "Invalid touchpad pointer in touch_event_task");
-            vTaskDelete(NULL);
-            return;
-        }
-
-        while (true) {
-            if (touchpad->WaitForTouchEvent()) {
-                auto &app = Application::GetInstance();
-                auto &board = (EspVocat &)Board::GetInstance();
-
-                ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
-                if (!touchpad->UpdateTouchPoint()) {
-                    continue;
-                }
-                auto touch_event = touchpad->CheckTouchEvent();
-
-                if (touch_event == Cst816s::TOUCH_RELEASE) {
-                    if (app.GetDeviceState() == kDeviceStateStarting) {
-                        board.EnterWifiConfigMode();
-                    } else {
-                        app.ToggleChatState();
-                    }
+        auto* self = static_cast<EspVocat*>(arg);
+        while (self && self->tp_) {
+            bool should_read = self->screen_touch_down_;
+            if (should_read) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            } else {
+                should_read = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20)) > 0;
+            }
+            if (should_read) {
+                esp_lcd_touch_point_data_t point = {};
+                uint8_t point_count = 0;
+                if (esp_lcd_touch_read_data(self->tp_) == ESP_OK) {
+                    esp_lcd_touch_get_data(self->tp_, &point, &point_count, 1);
+                    self->HandleScreenTouch(point_count > 0, point.x, point.y);
                 }
             }
+            if (self->touch_page_ == TouchPage::kMusic &&
+                esp_timer_get_time() - self->music_ui_refresh_us_ >= 500 * 1000) {
+                self->RenderMusicPage();
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
+        vTaskDelete(nullptr);
     }
 
     void InitializeCharge()
@@ -876,20 +1065,42 @@ private:
             ESP_LOGW(TAG, "Touch input disabled");
             return;
         }
-        cst816s_ = new Cst816s(i2c_bus_, 0x15);
-
-        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5, &touch_task_handle_, 1);
-
-        const gpio_config_t int_gpio_config = {
-            .pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
-            .mode = GPIO_MODE_INPUT,
-            // .intr_type = GPIO_INTR_NEGEDGE
-            .intr_type = GPIO_INTR_ANYEDGE
+        const esp_lcd_panel_io_i2c_config_t io_config = {
+            .dev_addr = ESP_LCD_TOUCH_IO_I2C_CST816S_ADDRESS,
+            .on_color_trans_done = nullptr,
+            .user_ctx = nullptr,
+            .control_phase_bytes = 1,
+            .dc_bit_offset = 0,
+            .lcd_cmd_bits = 8,
+            .lcd_param_bits = 0,
+            .flags = {
+                .dc_low_on_data = 0,
+                .disable_control_phase = 1,
+            },
+            .scl_speed_hz = 400 * 1000,
         };
-        gpio_config(&int_gpio_config);
-        gpio_install_isr_service(0);
-        gpio_intr_enable(TP_PIN_NUM_INT);
-        gpio_isr_handler_add(TP_PIN_NUM_INT, EspVocat::touch_isr_callback, cst816s_);
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &io_config, &touch_io_));
+        const esp_lcd_touch_config_t touch_config = {
+            .x_max = DISPLAY_WIDTH,
+            .y_max = DISPLAY_HEIGHT,
+            .rst_gpio_num = TP_PIN_NUM_RST,
+            .int_gpio_num = TP_PIN_NUM_INT,
+            .levels = {
+                .reset = 0,
+                .interrupt = 0,
+            },
+            .flags = {
+                .swap_xy = DISPLAY_SWAP_XY,
+                .mirror_x = DISPLAY_MIRROR_X,
+                .mirror_y = DISPLAY_MIRROR_Y,
+            },
+            .user_data = this,
+        };
+        ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst816s(touch_io_, &touch_config, &tp_));
+        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 6 * 1024, this, 5,
+                                &touch_task_handle_, 1);
+        ESP_ERROR_CHECK(esp_lcd_touch_register_interrupt_callback(tp_, TouchInterruptCallback));
+        ESP_LOGI(TAG, "CST816S touch settings input initialized");
     }
 
     void InitializeBmi270()
@@ -1244,6 +1455,10 @@ private:
 
 public:
     ~EspVocat() {
+        if (touch_task_handle_ != nullptr) {
+            vTaskDelete(touch_task_handle_);
+            touch_task_handle_ = nullptr;
+        }
         media_transfer_.reset();
         // Music owns a worker that may update the display, so stop it before deleting display objects.
         music_player_.reset();
@@ -1251,9 +1466,6 @@ public:
         // Stop tasks
         if (charge_task_handle_ != nullptr) {
             vTaskDelete(charge_task_handle_);
-        }
-        if (touch_task_handle_ != nullptr) {
-            vTaskDelete(touch_task_handle_);
         }
         if (imu_task_handle_ != nullptr) {
             vTaskDelete(imu_task_handle_);
@@ -1269,14 +1481,19 @@ public:
 
         // Delete objects
         delete charge_;
-        delete cst816s_;
+        if (tp_ != nullptr) {
+            esp_lcd_touch_del(tp_);
+            tp_ = nullptr;
+        }
+        if (touch_io_ != nullptr) {
+            esp_lcd_panel_io_del(touch_io_);
+            touch_io_ = nullptr;
+        }
         delete display_;
         // Note: backlight_ (PwmBacklight) and camera_ (EspVideo) are not deleted here
         // because their base classes (Backlight, Camera) don't have virtual destructors.
         // Since EspVocat is a singleton that lives for the device lifetime, this is acceptable.
 
-        // Remove GPIO ISR handler
-        gpio_isr_handler_remove(TP_PIN_NUM_INT);
         if (emotion_reset_timer_ != nullptr) {
             esp_timer_stop(emotion_reset_timer_);
             esp_timer_delete(emotion_reset_timer_);
@@ -1305,7 +1522,6 @@ public:
         InitializeI2c();
         uint8_t pcb_version = DetectPcbVersion();
         InitializeCharge();
-        InitializeCst816sTouchPad();
         InitializeBmi270();
 
         InitializeSpi();
@@ -1321,6 +1537,7 @@ public:
         });
         music_player_ = std::make_unique<SdMusicPlayer>();
         music_player_->RegisterMcpTools();
+        InitializeCst816sTouchPad();
         RegisterWallpaperMcpTools();
         if (auto* emote_display = dynamic_cast<emote::EmoteDisplay*>(display_)) {
             emote_display->RefreshCustomWallpapers();
@@ -1360,9 +1577,9 @@ public:
         return display_;
     }
 
-    Cst816s* GetTouchpad()
+    esp_lcd_touch_handle_t GetTouchpad()
     {
-        return cst816s_;
+        return tp_;
     }
 
     virtual Backlight* GetBacklight() override

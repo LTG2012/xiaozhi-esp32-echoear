@@ -764,13 +764,7 @@ bool EmoteDisplay::EnsureMusicUi()
         return false;
     }
 
-    music_font_ = LoadMusicFontFromAssets();
-    if (!music_font_) {
-        music_font_ = (gfx_font_t)&font_puhui_basic_20_4;
-        ESP_LOGW(TAG, "Emote common text font unavailable; using basic fallback");
-    } else {
-        music_font_owned_ = true;
-    }
+    music_font_ = EnsureCommonTextFont();
 
     emote_lock(emote_handle_);
     const int music_height = std::max(1, height_ - kMusicStatusBarHeight);
@@ -837,6 +831,22 @@ bool EmoteDisplay::EnsureMusicUi()
     music_progress_visible_ = false;
     emote_unlock(emote_handle_);
     return true;
+}
+
+gfx_font_t EmoteDisplay::EnsureCommonTextFont()
+{
+    if (music_font_) {
+        return music_font_;
+    }
+    music_font_ = LoadMusicFontFromAssets();
+    if (music_font_) {
+        music_font_owned_ = true;
+    } else {
+        music_font_ = static_cast<gfx_font_t>(
+            const_cast<lv_font_t*>(&font_puhui_basic_20_4));
+        ESP_LOGW(TAG, "Emote common text font unavailable; using basic fallback");
+    }
+    return music_font_;
 }
 
 bool EmoteDisplay::InitializeMusicTimeImage()
@@ -1060,8 +1070,9 @@ void EmoteDisplay::SetMusicLyrics(const char* title, const char* lyrics)
 
     emote_lock(emote_handle_);
     gfx_label_set_text(music_title_, title ? title : "");
-    gfx_obj_set_visible(music_background_, true);
-    gfx_obj_set_visible(music_title_, true);
+    const bool show_overlay = !touch_music_overlay_suppressed_;
+    gfx_obj_set_visible(music_background_, show_overlay);
+    gfx_obj_set_visible(music_title_, show_overlay);
     for (size_t i = 0; i < kMusicLyricRowCount; ++i) {
         const bool has_text = i < visual_rows.size() && !visual_rows[i].text.empty();
         gfx_label_set_text(music_lyric_rows_[i], has_text ? visual_rows[i].text.c_str() : "");
@@ -1069,14 +1080,14 @@ void EmoteDisplay::SetMusicLyrics(const char* title, const char* lyrics)
                             i < visual_rows.size() && visual_rows[i].current
                                 ? GFX_COLOR_HEX(0x62D9FF)
                                 : GFX_COLOR_HEX(0xFFFFFF));
-        gfx_obj_set_visible(music_lyric_rows_[i], has_text);
+        gfx_obj_set_visible(music_lyric_rows_[i], has_text && show_overlay);
     }
     if (!music_playback_info_visible_) {
         RenderMusicTimeImage("0:00/--:--");
         gfx_img_set_src(music_time_, &music_time_image_);
-        gfx_obj_set_visible(music_time_, true);
+        gfx_obj_set_visible(music_time_, show_overlay);
         for (auto* bar : music_rhythm_bars_) {
-            gfx_obj_set_visible(bar, true);
+            gfx_obj_set_visible(bar, show_overlay);
         }
         music_playback_info_visible_ = true;
     }
@@ -1106,10 +1117,8 @@ void EmoteDisplay::SetMusicProgress(int progress_permille)
                 (static_cast<uint16_t>(music_progress_pixel_alphas_[i]) * 72U + 127U) / 255U);
     }
     gfx_img_set_src(music_progress_, &music_progress_image_);
-    if (!music_progress_visible_) {
-        gfx_obj_set_visible(music_progress_, true);
-        music_progress_visible_ = true;
-    }
+    music_progress_visible_ = true;
+    gfx_obj_set_visible(music_progress_, !touch_music_overlay_suppressed_);
     emote_unlock(emote_handle_);
 }
 
@@ -1149,12 +1158,32 @@ void EmoteDisplay::SetMusicPlaybackInfo(int elapsed_seconds, int total_seconds,
         }
     }
     if (!music_playback_info_visible_) {
-        gfx_obj_set_visible(music_time_, true);
-        for (auto* bar : music_rhythm_bars_) {
-            gfx_obj_set_visible(bar, true);
-        }
         music_playback_info_visible_ = true;
     }
+    gfx_obj_set_visible(music_time_, !touch_music_overlay_suppressed_);
+    for (auto* bar : music_rhythm_bars_) {
+        gfx_obj_set_visible(bar, !touch_music_overlay_suppressed_);
+    }
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::SetMusicOverlayVisible(bool visible)
+{
+    if (!emote_handle_ || !music_background_) {
+        return;
+    }
+    const bool show = visible && wallpaper_music_active_;
+    emote_lock(emote_handle_);
+    gfx_obj_set_visible(music_background_, show);
+    gfx_obj_set_visible(music_title_, show);
+    for (auto* row : music_lyric_rows_) {
+        if (row) gfx_obj_set_visible(row, show);
+    }
+    if (music_time_) gfx_obj_set_visible(music_time_, show && music_playback_info_visible_);
+    for (auto* bar : music_rhythm_bars_) {
+        if (bar) gfx_obj_set_visible(bar, show && music_playback_info_visible_);
+    }
+    if (music_progress_) gfx_obj_set_visible(music_progress_, show && music_progress_visible_);
     emote_unlock(emote_handle_);
 }
 
@@ -1312,7 +1341,7 @@ bool EmoteDisplay::LoadWallpaperAsset(int index)
 size_t EmoteDisplay::WallpaperCount()
 {
     std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
-    return custom_wallpaper_paths_.empty() ? kWallpaperAssets.size() : custom_wallpaper_paths_.size();
+    return kWallpaperAssets.size() + custom_wallpaper_paths_.size();
 }
 
 bool EmoteDisplay::ScanCustomWallpapers(std::string& result)
@@ -1371,12 +1400,13 @@ bool EmoteDisplay::ScanCustomWallpapers(std::string& result)
     closedir(folder);
 
     std::sort(paths.begin(), paths.end());
+    const size_t custom_count = paths.size();
     {
         std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
         custom_wallpaper_paths_ = std::move(paths);
         custom_wallpaper_pixels_.clear();
     }
-    result = "Custom wallpaper scan found " + std::to_string(WallpaperCount()) + " JPEG file(s).";
+    result = "Custom wallpaper scan found " + std::to_string(custom_count) + " JPEG file(s).";
     return true;
 }
 
@@ -1389,7 +1419,8 @@ std::string EmoteDisplay::RefreshCustomWallpapers()
         custom_wallpaper_paths_.clear();
         custom_wallpaper_pixels_.clear();
     }
-    wallpaper_index_ = 0;
+    const size_t count = WallpaperCount();
+    wallpaper_index_ = count == 0 ? 0 : std::clamp(wallpaper_index_, 0, static_cast<int>(count - 1));
     wallpaper_shown_since_us_ = 0;
     ESP_LOGI(TAG, "%s", result.c_str());
     return result;
@@ -1491,19 +1522,15 @@ bool EmoteDisplay::LoadCustomWallpaper(int index)
 
 bool EmoteDisplay::LoadWallpaper(int index)
 {
-    bool has_custom_wallpapers = false;
-    {
-        std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
-        has_custom_wallpapers = !custom_wallpaper_paths_.empty();
-    }
-    if (!has_custom_wallpapers) {
+    if (index >= 0 && index < static_cast<int>(kWallpaperAssets.size())) {
         return LoadWallpaperAsset(index);
     }
-    if (LoadCustomWallpaper(index)) {
+    const int custom_index = index - static_cast<int>(kWallpaperAssets.size());
+    if (LoadCustomWallpaper(custom_index)) {
         return true;
     }
     ESP_LOGW(TAG, "Custom wallpaper %d failed; using an internal wallpaper", index);
-    return LoadWallpaperAsset(index % kWallpaperAssets.size());
+    return LoadWallpaperAsset(index >= 0 ? index % kWallpaperAssets.size() : 0);
 }
 
 void EmoteDisplay::SetWallpaperNativeUiVisible(bool visible)
@@ -1648,7 +1675,7 @@ void EmoteDisplay::TickWallpaper()
     if (wallpaper_refresh_requested_.exchange(false, std::memory_order_acq_rel)) {
         RefreshCustomWallpapers();
     }
-    if (media_transfer_qr_visible_) {
+    if (media_transfer_qr_visible_ || touch_settings_visible_) {
         return;
     }
     const int64_t now_us = esp_timer_get_time();
@@ -1732,6 +1759,7 @@ void EmoteDisplay::UpdateWallpaperText(bool force)
 void EmoteDisplay::LoadWallpaperSettings()
 {
     Settings settings("wallpaper", false);
+    wallpaper_index_ = std::max(0, static_cast<int>(settings.GetInt("index", 0)));
     wallpaper_city_ = settings.GetString("city");
     if (settings.GetBool("weather_valid", false)) {
         wallpaper_condition_ = settings.GetString("condition");
@@ -1744,6 +1772,7 @@ void EmoteDisplay::LoadWallpaperSettings()
 void EmoteDisplay::SaveWallpaperSettings()
 {
     Settings settings("wallpaper", true);
+    settings.SetInt("index", wallpaper_index_);
     settings.SetString("city", wallpaper_city_);
     settings.SetBool("weather_valid", !wallpaper_condition_.empty());
     if (!wallpaper_condition_.empty()) {
@@ -1760,6 +1789,384 @@ void EmoteDisplay::SetPowerSaveMode(bool on)
     if (!emote_handle_) {
         return;
     }
+}
+
+bool EmoteDisplay::EnsureTouchSettingsUi()
+{
+    if (!emote_handle_) {
+        return false;
+    }
+    if (touch_background_ && touch_wallpaper_image_ && touch_title_ && touch_back_ && touch_close_ &&
+        touch_footer_ && touch_slider_track_ && touch_slider_fill_ && touch_slider_knob_) {
+        return true;
+    }
+
+    touch_background_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
+                                                  "touch_background");
+    // The renderer paints objects in creation order. Keep a dedicated preview
+    // above the settings background and below every control.
+    touch_wallpaper_image_ = emote_create_obj_by_type(
+        emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "touch_wallpaper_image");
+    touch_title_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_title");
+    touch_back_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_back");
+    touch_close_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_close");
+    for (size_t i = 0; i < touch_rows_.size(); ++i) {
+        const std::string name = "touch_row_" + std::to_string(i);
+        touch_rows_[i] = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, name.c_str());
+    }
+    touch_footer_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_footer");
+    touch_slider_track_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
+                                                   "touch_slider_track");
+    touch_slider_fill_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
+                                                  "touch_slider_fill");
+    touch_slider_knob_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
+                                                  "touch_slider_knob");
+    for (size_t i = 0; i < touch_controls_.size(); ++i) {
+        const std::string name = "touch_control_" + std::to_string(i);
+        touch_controls_[i] = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, name.c_str());
+    }
+
+    bool ready = touch_background_ && touch_wallpaper_image_ && touch_title_ && touch_back_ && touch_close_ &&
+                 touch_footer_ && touch_slider_track_ && touch_slider_fill_ && touch_slider_knob_;
+    for (auto* row : touch_rows_) ready = ready && row;
+    for (auto* control : touch_controls_) ready = ready && control;
+    if (!ready) {
+        ESP_LOGE(TAG, "Unable to create touch settings objects");
+        return false;
+    }
+
+    const gfx_font_t touch_font = EnsureCommonTextFont();
+    emote_lock(emote_handle_);
+    gfx_obj_set_size(touch_background_, width_, height_);
+    gfx_label_set_text(touch_background_, "");
+    gfx_label_set_bg_enable(touch_background_, true);
+    gfx_label_set_bg_color(touch_background_, GFX_COLOR_HEX(0x080B14));
+    gfx_label_set_opa(touch_background_, 255);
+    gfx_obj_set_pos(touch_wallpaper_image_, 0, 0);
+    gfx_obj_set_visible(touch_wallpaper_image_, false);
+
+    auto style_text = [touch_font](gfx_obj_t* obj, gfx_color_t color) {
+        gfx_label_set_font(obj, touch_font);
+        gfx_label_set_color(obj, color);
+        gfx_label_set_text_align(obj, GFX_TEXT_ALIGN_CENTER);
+        gfx_label_set_long_mode(obj, GFX_LABEL_LONG_CLIP);
+    };
+    style_text(touch_title_, GFX_COLOR_HEX(0xF4F8FF));
+    style_text(touch_back_, GFX_COLOR_HEX(0x62D9FF));
+    style_text(touch_close_, GFX_COLOR_HEX(0xA8B4C8));
+    style_text(touch_footer_, GFX_COLOR_HEX(0xA8B4C8));
+    for (auto* row : touch_rows_) {
+        style_text(row, GFX_COLOR_HEX(0xF4F8FF));
+        gfx_label_set_bg_enable(row, true);
+        gfx_label_set_bg_color(row, GFX_COLOR_HEX(0x172033));
+        gfx_label_set_opa(row, 245);
+    }
+    gfx_label_set_bg_enable(touch_back_, false);
+    gfx_label_set_bg_enable(touch_close_, false);
+    for (auto* control : touch_controls_) {
+        style_text(control, GFX_COLOR_HEX(0xF4F8FF));
+        gfx_label_set_bg_enable(control, true);
+        gfx_label_set_bg_color(control, GFX_COLOR_HEX(0x1D6F88));
+        gfx_label_set_opa(control, 250);
+    }
+    for (auto* bar : {touch_slider_track_, touch_slider_fill_, touch_slider_knob_}) {
+        gfx_label_set_text(bar, "");
+        gfx_label_set_bg_enable(bar, true);
+    }
+    gfx_label_set_bg_color(touch_slider_track_, GFX_COLOR_HEX(0x3B465C));
+    gfx_label_set_bg_color(touch_slider_fill_, GFX_COLOR_HEX(0x62D9FF));
+    gfx_label_set_bg_color(touch_slider_knob_, GFX_COLOR_HEX(0xF4F8FF));
+    emote_unlock(emote_handle_);
+    HideTouchObjects();
+    return true;
+}
+
+void EmoteDisplay::HideTouchObjects()
+{
+    if (!emote_handle_ || !touch_background_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    for (auto* obj : {touch_background_, touch_wallpaper_image_, touch_title_, touch_back_, touch_close_, touch_footer_,
+                      touch_slider_track_, touch_slider_fill_, touch_slider_knob_}) {
+        gfx_obj_set_visible(obj, false);
+    }
+    for (auto* row : touch_rows_) gfx_obj_set_visible(row, false);
+    for (auto* control : touch_controls_) gfx_obj_set_visible(control, false);
+    if (touch_music_return_) gfx_obj_set_visible(touch_music_return_, false);
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::RestoreTouchWallpaperPreview()
+{
+    if (!touch_wallpaper_preview_) {
+        return;
+    }
+    const bool loaded = LoadWallpaper(wallpaper_index_);
+    SetWallpaperNativeUiVisible(!touch_wallpaper_restore_visible_);
+    emote_lock(emote_handle_);
+    if (loaded && touch_wallpaper_restore_visible_) {
+        gfx_img_set_src(wallpaper_image_, &wallpaper_image_dsc_);
+        gfx_obj_set_visible(wallpaper_image_, true);
+    } else {
+        gfx_obj_set_visible(wallpaper_image_, false);
+    }
+    emote_unlock(emote_handle_);
+    wallpaper_visible_ = touch_wallpaper_restore_visible_ && loaded;
+    touch_wallpaper_preview_ = false;
+}
+
+void EmoteDisplay::ShowTouchMenu(int reveal_height)
+{
+    if (!EnsureTouchSettingsUi()) return;
+    touch_music_overlay_suppressed_ = true;
+    SetMusicOverlayVisible(false);
+    RestoreTouchWallpaperPreview();
+    HideTouchObjects();
+    touch_settings_visible_ = true;
+    const int offset = std::clamp(reveal_height, 0, height_) - height_;
+    static constexpr std::array<const char*, 4> labels = {
+        "音量调节", "亮度调节", "查看壁纸", "音乐列表",
+    };
+    emote_lock(emote_handle_);
+    gfx_label_set_opa(touch_background_, 255);
+    gfx_obj_set_pos(touch_background_, 0, offset);
+    gfx_obj_set_visible(touch_background_, true);
+    gfx_obj_set_size(touch_title_, 170, 36);
+    gfx_obj_set_pos(touch_title_, 95, 40 + offset);
+    gfx_label_set_text(touch_title_, "控制中心");
+    gfx_obj_set_visible(touch_title_, true);
+    gfx_obj_set_size(touch_close_, 62, 36);
+    gfx_obj_set_pos(touch_close_, 244, 42 + offset);
+    gfx_label_set_text(touch_close_, "关闭");
+    gfx_obj_set_visible(touch_close_, true);
+    for (size_t i = 0; i < labels.size(); ++i) {
+        gfx_label_set_bg_color(touch_rows_[i], GFX_COLOR_HEX(i == 0 ? 0x18344C : 0x152438));
+        gfx_label_set_opa(touch_rows_[i], 220);
+        gfx_obj_set_size(touch_rows_[i], 236, 40);
+        gfx_obj_set_pos(touch_rows_[i], 62, 82 + static_cast<int>(i) * 47 + offset);
+        gfx_label_set_text(touch_rows_[i], labels[i]);
+        gfx_obj_set_visible(touch_rows_[i], true);
+    }
+    gfx_obj_set_size(touch_footer_, 250, 28);
+    gfx_obj_set_pos(touch_footer_, 55, 278 + offset);
+    gfx_label_set_text(touch_footer_, "上滑收起");
+    gfx_obj_set_visible(touch_footer_, true);
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::ShowTouchSlider(const char* title, int value)
+{
+    if (!EnsureTouchSettingsUi()) return;
+    touch_music_overlay_suppressed_ = true;
+    SetMusicOverlayVisible(false);
+    RestoreTouchWallpaperPreview();
+    HideTouchObjects();
+    touch_settings_visible_ = true;
+    value = std::clamp(value, 0, 100);
+    const int fill_width = std::max(1, value * 270 / 100);
+    emote_lock(emote_handle_);
+    gfx_label_set_opa(touch_background_, 255);
+    gfx_obj_set_pos(touch_background_, 0, 0);
+    gfx_obj_set_visible(touch_background_, true);
+    gfx_obj_set_size(touch_back_, 86, 40);
+    gfx_obj_set_pos(touch_back_, 52, 42);
+    gfx_label_set_text(touch_back_, "<  返回");
+    gfx_obj_set_visible(touch_back_, true);
+    gfx_obj_set_size(touch_title_, 150, 40);
+    gfx_obj_set_pos(touch_title_, 136, 42);
+    gfx_label_set_text(touch_title_, title ? title : "设置");
+    gfx_obj_set_visible(touch_title_, true);
+    gfx_label_set_bg_color(touch_rows_[0], GFX_COLOR_HEX(0x152438));
+    gfx_label_set_opa(touch_rows_[0], 210);
+    gfx_obj_set_size(touch_rows_[0], 150, 48);
+    gfx_obj_set_pos(touch_rows_[0], 105, 108);
+    gfx_label_set_text_fmt(touch_rows_[0], "%d%%", value);
+    gfx_obj_set_visible(touch_rows_[0], true);
+    gfx_obj_set_size(touch_slider_track_, 270, 14);
+    gfx_obj_set_pos(touch_slider_track_, 45, 190);
+    gfx_obj_set_visible(touch_slider_track_, true);
+    gfx_obj_set_size(touch_slider_fill_, fill_width, 14);
+    gfx_obj_set_pos(touch_slider_fill_, 45, 190);
+    gfx_obj_set_visible(touch_slider_fill_, true);
+    gfx_obj_set_size(touch_slider_knob_, 28, 28);
+    gfx_obj_set_pos(touch_slider_knob_, 45 + fill_width - 14, 183);
+    gfx_obj_set_visible(touch_slider_knob_, true);
+    gfx_obj_set_size(touch_footer_, 280, 32);
+    gfx_obj_set_pos(touch_footer_, 40, 242);
+    gfx_label_set_text(touch_footer_, "拖动滑块，松手后保存");
+    gfx_obj_set_visible(touch_footer_, true);
+    emote_unlock(emote_handle_);
+}
+
+int EmoteDisplay::GetTouchWallpaperCount()
+{
+    return static_cast<int>(WallpaperCount());
+}
+
+std::string EmoteDisplay::GetTouchWallpaperName(int index)
+{
+    static constexpr std::array<const char*, 3> internal_names = {"晨曦", "日间", "夜色"};
+    if (index >= 0 && index < static_cast<int>(internal_names.size())) {
+        return internal_names[index];
+    }
+    const int custom_index = index - static_cast<int>(kWallpaperAssets.size());
+    std::lock_guard<std::mutex> lock(wallpaper_data_mutex_);
+    if (custom_index < 0 || custom_index >= static_cast<int>(custom_wallpaper_paths_.size())) {
+        return "壁纸";
+    }
+    const std::string& path = custom_wallpaper_paths_[custom_index];
+    const size_t slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+bool EmoteDisplay::ShowTouchWallpaper(int index)
+{
+    if (!EnsureTouchSettingsUi()) return false;
+    touch_music_overlay_suppressed_ = true;
+    SetMusicOverlayVisible(false);
+    if (!touch_wallpaper_preview_) {
+        touch_wallpaper_restore_visible_ = wallpaper_visible_;
+    }
+    if (!LoadWallpaper(index)) return false;
+    HideTouchObjects();
+    touch_settings_visible_ = true;
+    touch_wallpaper_preview_ = true;
+    SetWallpaperNativeUiVisible(false);
+    const std::string name = GetTouchWallpaperName(index);
+    const int count = GetTouchWallpaperCount();
+    emote_lock(emote_handle_);
+    gfx_obj_set_visible(wallpaper_image_, false);
+    gfx_obj_set_visible(wallpaper_fade_, false);
+    gfx_label_set_opa(touch_background_, 255);
+    gfx_obj_set_pos(touch_background_, 0, 0);
+    gfx_obj_set_visible(touch_background_, true);
+    gfx_img_set_src(touch_wallpaper_image_, &wallpaper_image_dsc_);
+    gfx_obj_set_pos(touch_wallpaper_image_, 0, 0);
+    gfx_obj_set_visible(touch_wallpaper_image_, true);
+    gfx_label_set_bg_enable(touch_back_, false);
+    gfx_obj_set_size(touch_back_, 86, 36);
+    gfx_obj_set_pos(touch_back_, 48, 42);
+    gfx_label_set_text(touch_back_, "<  返回");
+    gfx_obj_set_visible(touch_back_, true);
+    gfx_obj_set_size(touch_title_, 130, 36);
+    gfx_obj_set_pos(touch_title_, 135, 42);
+    gfx_label_set_text(touch_title_, "壁纸预览");
+    gfx_obj_set_visible(touch_title_, true);
+    gfx_label_set_bg_color(touch_rows_[0], GFX_COLOR_HEX(0x071421));
+    gfx_label_set_opa(touch_rows_[0], 175);
+    gfx_obj_set_size(touch_rows_[0], 190, 34);
+    gfx_obj_set_pos(touch_rows_[0], 85, 266);
+    gfx_label_set_text(touch_rows_[0], name.c_str());
+    gfx_obj_set_visible(touch_rows_[0], true);
+    gfx_obj_set_size(touch_footer_, 220, 26);
+    gfx_obj_set_pos(touch_footer_, 70, 302);
+    gfx_label_set_text_fmt(touch_footer_, "%d/%d  左右滑 · 点按", index + 1, count);
+    gfx_obj_set_visible(touch_footer_, true);
+    emote_unlock(emote_handle_);
+    return true;
+}
+
+bool EmoteDisplay::ApplyTouchWallpaper(int index)
+{
+    if (index < 0 || index >= GetTouchWallpaperCount()) return false;
+    wallpaper_index_ = index;
+    SaveWallpaperSettings();
+    wallpaper_shown_since_us_ = esp_timer_get_time();
+    return true;
+}
+
+void EmoteDisplay::ShowTouchMusic(const std::vector<std::string>& titles, int first_index,
+                                  int selected_index, const char* status)
+{
+    if (!EnsureTouchSettingsUi()) return;
+    touch_music_overlay_suppressed_ = true;
+    SetMusicOverlayVisible(false);
+    RestoreTouchWallpaperPreview();
+    HideTouchObjects();
+    touch_settings_visible_ = true;
+    emote_lock(emote_handle_);
+    gfx_label_set_opa(touch_background_, 255);
+    gfx_obj_set_pos(touch_background_, 0, 0);
+    gfx_obj_set_visible(touch_background_, true);
+    gfx_obj_set_size(touch_back_, 86, 40);
+    gfx_obj_set_pos(touch_back_, 52, 38);
+    gfx_label_set_text(touch_back_, "<  返回");
+    gfx_obj_set_visible(touch_back_, true);
+    gfx_obj_set_size(touch_title_, 150, 40);
+    gfx_obj_set_pos(touch_title_, 136, 38);
+    gfx_label_set_text(touch_title_, "音乐列表");
+    gfx_obj_set_visible(touch_title_, true);
+    for (size_t row = 0; row < touch_rows_.size(); ++row) {
+        const int index = first_index + static_cast<int>(row);
+        gfx_obj_set_size(touch_rows_[row], 256, 36);
+        gfx_obj_set_pos(touch_rows_[row], 52, 80 + static_cast<int>(row) * 40);
+        if (index >= 0 && index < static_cast<int>(titles.size())) {
+            const std::string label = (index == selected_index ? "> " : "") + titles[index];
+            gfx_label_set_text(touch_rows_[row], label.c_str());
+            gfx_label_set_bg_color(touch_rows_[row], GFX_COLOR_HEX(
+                index == selected_index ? 0x1D6F88 : 0x172033));
+            gfx_obj_set_visible(touch_rows_[row], true);
+        } else {
+            gfx_obj_set_visible(touch_rows_[row], false);
+        }
+    }
+    if (titles.empty() && status && status[0]) {
+        gfx_obj_set_size(touch_rows_[0], 256, 90);
+        gfx_obj_set_pos(touch_rows_[0], 52, 120);
+        gfx_label_set_text(touch_rows_[0], status);
+        gfx_obj_set_visible(touch_rows_[0], true);
+    }
+    static constexpr std::array<const char*, 3> controls = {"上一首", "播放", "下一首"};
+    for (size_t i = 0; i < touch_controls_.size(); ++i) {
+        gfx_obj_set_size(touch_controls_[i], 64, 38);
+        gfx_obj_set_pos(touch_controls_[i], 72 + static_cast<int>(i) * 76, 286);
+        gfx_label_set_text(touch_controls_[i], controls[i]);
+        gfx_obj_set_visible(touch_controls_[i], true);
+    }
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::ShowTouchMusicPlayback()
+{
+    if (!EnsureMusicUi() || !EnsureTouchSettingsUi()) return;
+    HideTouchObjects();
+    touch_settings_visible_ = true;
+    touch_music_overlay_suppressed_ = false;
+    SetMusicOverlayVisible(true);
+
+    if (!touch_music_return_) {
+        touch_music_return_ = emote_create_obj_by_type(
+            emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_music_return");
+        if (!touch_music_return_) {
+            ESP_LOGE(TAG, "Unable to create music playback return control");
+            return;
+        }
+        emote_lock(emote_handle_);
+        gfx_label_set_font(touch_music_return_, EnsureCommonTextFont());
+        gfx_label_set_color(touch_music_return_, GFX_COLOR_HEX(0x62D9FF));
+        gfx_label_set_text_align(touch_music_return_, GFX_TEXT_ALIGN_CENTER);
+        gfx_label_set_long_mode(touch_music_return_, GFX_LABEL_LONG_CLIP);
+        gfx_label_set_bg_enable(touch_music_return_, false);
+        emote_unlock(emote_handle_);
+    }
+
+    emote_lock(emote_handle_);
+    gfx_obj_set_size(touch_music_return_, 126, 38);
+    gfx_obj_set_pos(touch_music_return_, 38, 34);
+    gfx_label_set_text(touch_music_return_, "<  音乐列表");
+    gfx_obj_set_visible(touch_music_return_, true);
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::HideTouchSettings()
+{
+    if (!touch_settings_visible_) return;
+    RestoreTouchWallpaperPreview();
+    HideTouchObjects();
+    touch_settings_visible_ = false;
+    touch_music_overlay_suppressed_ = false;
+    SetMusicOverlayVisible(true);
 }
 
 void EmoteDisplay::SetPreviewImage(const void* image)

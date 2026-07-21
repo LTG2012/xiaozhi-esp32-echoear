@@ -230,6 +230,72 @@ bool SdMusicPlayer::IsActive() const {
     return state_ != State::kStopped;
 }
 
+SdMusicPlayer::UiSnapshot SdMusicPlayer::GetUiSnapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    UiSnapshot snapshot;
+    snapshot.library_ready = scanned_ && !scanning_;
+    snapshot.library_error = library_error_;
+    snapshot.current_index = current_index_;
+    snapshot.state = state_ == State::kPlaying ? UiState::kPlaying
+                     : state_ == State::kPaused ? UiState::kPaused
+                                                : UiState::kStopped;
+    snapshot.titles.reserve(songs_.size());
+    for (const auto& song : songs_) {
+        snapshot.titles.push_back(song.title);
+    }
+    return snapshot;
+}
+
+std::string SdMusicPlayer::PlayIndex(int index) {
+    if (worker_task_ == nullptr) {
+        return "音乐播放任务启动失败，请重启设备。";
+    }
+    const std::string error = EnsureLibrary();
+    if (!error.empty()) {
+        return error;
+    }
+    std::string title;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (index < 0 || index >= static_cast<int>(songs_.size())) {
+            return "歌曲序号无效。";
+        }
+        SelectTrackLocked(index);
+        title = songs_[index].title;
+    }
+    ShowMusicText(title, "正在加载歌词…");
+    Application::GetInstance().EndConversation();
+    xTaskNotifyGive(worker_task_);
+    return "正在播放《" + title + "》。";
+}
+
+std::string SdMusicPlayer::TogglePauseResume() {
+    UiState state;
+    int current_index;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        state = state_ == State::kPlaying ? UiState::kPlaying
+                : state_ == State::kPaused ? UiState::kPaused
+                                           : UiState::kStopped;
+        current_index = current_index_;
+    }
+    if (state == UiState::kPlaying) {
+        return Control("pause");
+    }
+    if (state == UiState::kPaused) {
+        return Control("resume");
+    }
+    return PlayIndex(current_index >= 0 ? current_index : 0);
+}
+
+std::string SdMusicPlayer::PlayPrevious() {
+    return Control("previous");
+}
+
+std::string SdMusicPlayer::PlayNext() {
+    return Control("next");
+}
+
 void SdMusicPlayer::RequestLibraryRefresh() {
     Application::GetInstance().Schedule([this]() {
         {
@@ -238,6 +304,8 @@ void SdMusicPlayer::RequestLibraryRefresh() {
                 return;
             }
             scanned_ = false;
+            scanning_ = true;
+            library_error_.clear();
         }
         (void)EnsureLibrary();
     });
@@ -701,6 +769,9 @@ bool SdMusicPlayer::IsCurrentGeneration(uint32_t generation) {
 std::string SdMusicPlayer::EnsureLibrary() {
     const std::string mount_error = SdCardManager::GetInstance().EnsureMounted();
     if (!mount_error.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        scanning_ = false;
+        library_error_ = mount_error;
         return mount_error;
     }
 
@@ -719,6 +790,9 @@ std::string SdMusicPlayer::EnsureLibrary() {
         if (!scanned) {
             std::string error;
             if (!ScanLibrary(error)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                scanning_ = false;
+                library_error_ = error;
                 return error;
             }
         }
@@ -726,8 +800,12 @@ std::string SdMusicPlayer::EnsureLibrary() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (songs_.empty()) {
-            return "SD卡已挂载，但/music及根目录中没有找到MP3歌曲。";
+            library_error_ = "SD卡已挂载，但/music及根目录中没有找到MP3歌曲。";
+            scanning_ = false;
+            return library_error_;
         }
+        library_error_.clear();
+        scanning_ = false;
     }
     return {};
 }
@@ -749,6 +827,8 @@ bool SdMusicPlayer::ScanLibrary(std::string& error) {
         error = "SD卡已挂载，但/music及根目录中没有找到MP3歌曲。";
     }
     scanned_ = true;
+    scanning_ = false;
+    library_error_ = error;
     ESP_LOGI(kTag, "SD music scan found %u song(s)",
              static_cast<unsigned>(songs_.size()));
     return error.empty();
@@ -796,6 +876,7 @@ void SdMusicPlayer::MarkCardUnavailable() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         scanned_ = false;
+        scanning_ = false;
     }
     SdCardManager::GetInstance().MarkUnavailable();
 }
