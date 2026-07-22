@@ -727,7 +727,7 @@ private:
 
     static int SliderValueFromX(int x)
     {
-        return std::clamp((x - 45) * 100 / 270, 0, 100);
+        return std::clamp((x - 50) * 100 / 260, 0, 100);
     }
 
     static const char* TouchPageName(TouchPage page)
@@ -982,10 +982,14 @@ private:
                 CloseTouchSettings();
                 return;
             }
-            if (tap && touch_start_x_ >= 45 && touch_start_x_ <= 315 &&
-                touch_start_y_ >= 78 && touch_start_y_ < 274) {
-                const int row = (touch_start_y_ - 82) / 48;
-                if (row >= 0 && row < 4) OpenTouchPage(row);
+            if (tap && touch_start_y_ >= 82 && touch_start_y_ < 256) {
+                const int column = touch_start_x_ >= 43 && touch_start_x_ < 176 ? 0
+                    : touch_start_x_ >= 184 && touch_start_x_ < 317 ? 1 : -1;
+                const int card_row = touch_start_y_ < 164 ? 0
+                    : touch_start_y_ >= 174 ? 1 : -1;
+                if (column >= 0 && card_row >= 0) {
+                    OpenTouchPage(card_row * 2 + column);
+                }
             }
             return;
         }
@@ -1037,8 +1041,8 @@ private:
                 music_first_index_ = std::clamp(music_first_index_ + (dy < 0 ? 1 : -1), 0, max_first);
                 ESP_LOGI(TAG, "Touch music scroll first=%d", music_first_index_);
                 RenderMusicPage();
-            } else if (tap && touch_start_y_ >= 78 && touch_start_y_ < 282) {
-                const int index = music_first_index_ + (touch_start_y_ - 80) / 40;
+            } else if (tap && touch_start_y_ >= 88 && touch_start_y_ < 268) {
+                const int index = music_first_index_ + (touch_start_y_ - 88) / 36;
                 const auto snapshot = music_player_->GetUiSnapshot();
                 if (index >= 0 && index < static_cast<int>(snapshot.titles.size())) {
                     ESP_LOGI(TAG, "Touch music select index=%d", index);
@@ -1046,7 +1050,7 @@ private:
                     RenderMusicPage();
                 }
             } else if (tap && touch_start_x_ >= 60 && touch_start_x_ <= 300 &&
-                       touch_start_y_ >= 280 && touch_start_y_ <= 332) {
+                       touch_start_y_ >= 278 && touch_start_y_ <= 328) {
                 const int control = std::clamp((touch_start_x_ - 66) / 76, 0, 2);
                 ESP_LOGI(TAG, "Touch music control=%d", control);
                 const auto snapshot = music_player_->GetUiSnapshot();

@@ -83,6 +83,84 @@ static constexpr char kWallpaperDirectory[] = "/wallpapers";
 static constexpr size_t kMaxCustomWallpapers = 64;
 static constexpr off_t kMaxCustomWallpaperBytes = 2 * 1024 * 1024;
 static constexpr uint16_t kMaxCustomWallpaperDimension = 1024;
+static constexpr int kTouchSurfaceWidth = 360;
+static constexpr int kTouchSurfaceHeight = 360;
+static constexpr int kTouchSliderVisualWidth = 280;
+static constexpr int kTouchSliderVisualHeight = 40;
+
+static uint16_t TouchUiColor(uint32_t color)
+{
+    return __builtin_bswap16(gfx_color_hex(color).full);
+}
+
+static uint32_t MixTouchUiColor(uint32_t first, uint32_t second, int amount)
+{
+    amount = std::clamp(amount, 0, 255);
+    const int inverse = 255 - amount;
+    const uint32_t red = (((first >> 16) & 0xFF) * inverse + ((second >> 16) & 0xFF) * amount) / 255;
+    const uint32_t green = (((first >> 8) & 0xFF) * inverse + ((second >> 8) & 0xFF) * amount) / 255;
+    const uint32_t blue = ((first & 0xFF) * inverse + (second & 0xFF) * amount) / 255;
+    return (red << 16) | (green << 8) | blue;
+}
+
+static bool TouchUiPointInRoundedRect(int px, int py, int x, int y, int width, int height, int radius)
+{
+    if (px < x || py < y || px >= x + width || py >= y + height) {
+        return false;
+    }
+    radius = std::max(0, std::min(radius, std::min(width, height) / 2));
+    if (radius == 0 || (px >= x + radius && px < x + width - radius) ||
+        (py >= y + radius && py < y + height - radius)) {
+        return true;
+    }
+    const int center_x = px < x + radius ? x + radius : x + width - radius - 1;
+    const int center_y = py < y + radius ? y + radius : y + height - radius - 1;
+    const int dx = px - center_x;
+    const int dy = py - center_y;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
+static void FillTouchUiRoundedRect(std::vector<uint8_t>& data, int image_width, int image_height,
+                                   int x, int y, int width, int height, int radius,
+                                   uint32_t color, uint8_t alpha = 255)
+{
+    const size_t pixel_count = static_cast<size_t>(image_width) * image_height;
+    auto* colors = reinterpret_cast<uint16_t*>(data.data());
+    auto* alphas = data.data() + pixel_count * sizeof(uint16_t);
+    const uint16_t converted_color = TouchUiColor(color);
+    for (int py = std::max(0, y); py < std::min(image_height, y + height); ++py) {
+        for (int px = std::max(0, x); px < std::min(image_width, x + width); ++px) {
+            if (TouchUiPointInRoundedRect(px, py, x, y, width, height, radius)) {
+                const size_t pixel = static_cast<size_t>(py) * image_width + px;
+                colors[pixel] = converted_color;
+                alphas[pixel] = alpha;
+            }
+        }
+    }
+}
+
+static void FillTouchUiCircle(std::vector<uint8_t>& data, int image_width, int image_height,
+                              int center_x, int center_y, int radius, uint32_t color,
+                              uint8_t alpha = 255)
+{
+    const int radius_squared = radius * radius;
+    const size_t pixel_count = static_cast<size_t>(image_width) * image_height;
+    auto* colors = reinterpret_cast<uint16_t*>(data.data());
+    auto* alphas = data.data() + pixel_count * sizeof(uint16_t);
+    const uint16_t converted_color = TouchUiColor(color);
+    for (int y = center_y - radius; y <= center_y + radius; ++y) {
+        for (int x = center_x - radius; x <= center_x + radius; ++x) {
+            const int dx = x - center_x;
+            const int dy = y - center_y;
+            if (x >= 0 && y >= 0 && x < image_width && y < image_height &&
+                dx * dx + dy * dy <= radius_squared) {
+                const size_t pixel = static_cast<size_t>(y) * image_width + x;
+                colors[pixel] = converted_color;
+                alphas[pixel] = alpha;
+            }
+        }
+    }
+}
 
 static bool HasJpegExtension(const char* name)
 {
@@ -277,6 +355,34 @@ static int EstimateMusicGlyphWidth(uint32_t codepoint)
         return 11;
     }
     return 20;
+}
+
+static std::string TruncateTouchText(const std::string& text, int width_limit)
+{
+    int total_width = 0;
+    size_t scan_position = 0;
+    while (scan_position < text.size()) {
+        size_t byte_count = 0;
+        total_width += EstimateMusicGlyphWidth(
+            DecodeUtf8Codepoint(text, scan_position, byte_count));
+    }
+    if (total_width <= width_limit) {
+        return text;
+    }
+
+    int width = 0;
+    size_t position = 0;
+    while (position < text.size()) {
+        const size_t character_start = position;
+        size_t byte_count = 0;
+        const uint32_t codepoint = DecodeUtf8Codepoint(text, position, byte_count);
+        const int glyph_width = EstimateMusicGlyphWidth(codepoint);
+        if (width + glyph_width + 20 > width_limit) {
+            return text.substr(0, character_start) + "…";
+        }
+        width += glyph_width;
+    }
+    return text;
 }
 
 static std::vector<MusicLyricSourceLine> ParseMusicLyricSource(const char* lyrics)
@@ -1799,23 +1905,169 @@ void EmoteDisplay::SetPowerSaveMode(bool on)
     }
 }
 
+bool EmoteDisplay::InitializeTouchSurface()
+{
+    if (!touch_surface_image_data_.empty()) {
+        return true;
+    }
+    const size_t pixel_count = static_cast<size_t>(kTouchSurfaceWidth) * kTouchSurfaceHeight;
+    touch_surface_image_data_.assign(pixel_count * 3, 0);
+    touch_surface_image_.header.magic = C_ARRAY_HEADER_MAGIC;
+    touch_surface_image_.header.cf = GFX_COLOR_FORMAT_RGB565A8;
+    touch_surface_image_.header.flags = 0;
+    touch_surface_image_.header.w = kTouchSurfaceWidth;
+    touch_surface_image_.header.h = kTouchSurfaceHeight;
+    touch_surface_image_.header.stride = kTouchSurfaceWidth * sizeof(uint16_t);
+    touch_surface_image_.header.reserved = 0;
+    touch_surface_image_.data_size = touch_surface_image_data_.size();
+    touch_surface_image_.data = touch_surface_image_data_.data();
+    return true;
+}
+
+void EmoteDisplay::RenderTouchSurface(TouchView view, int selected_row)
+{
+    if (!InitializeTouchSurface()) {
+        return;
+    }
+
+    std::fill(touch_surface_image_data_.begin(), touch_surface_image_data_.end(), 0);
+    const bool transparent_background = view == TouchView::kWallpaper || view == TouchView::kPlayback;
+    if (!transparent_background) {
+        const size_t pixel_count = static_cast<size_t>(kTouchSurfaceWidth) * kTouchSurfaceHeight;
+        auto* colors = reinterpret_cast<uint16_t*>(touch_surface_image_data_.data());
+        auto* alphas = touch_surface_image_data_.data() + pixel_count * sizeof(uint16_t);
+        for (int y = 0; y < kTouchSurfaceHeight; ++y) {
+            uint32_t color = MixTouchUiColor(0x071019, 0x0A0F17, y * 255 / kTouchSurfaceHeight);
+            if (y < 132) {
+                color = MixTouchUiColor(color, 0x10303A, (132 - y) * 54 / 132);
+            }
+            std::fill_n(colors + static_cast<size_t>(y) * kTouchSurfaceWidth,
+                        kTouchSurfaceWidth, TouchUiColor(color));
+            std::memset(alphas + static_cast<size_t>(y) * kTouchSurfaceWidth,
+                        255, kTouchSurfaceWidth);
+        }
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               154, 19, 52, 4, 2, 0x6CE7F2, 210);
+    }
+
+    if (view == TouchView::kMenu) {
+        static constexpr std::array<std::array<int, 2>, 4> positions = {{
+            {43, 82}, {184, 82}, {43, 174}, {184, 174},
+        }};
+        for (size_t i = 0; i < positions.size(); ++i) {
+            const int x = positions[i][0];
+            const int y = positions[i][1];
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   x, y, 133, 82, 18, 0x263443);
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   x + 1, y + 1, 131, 80, 17, 0x111B27);
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   x + 16, y + 13, 24, 4, 2, 0x58DCE8, i == 0 ? 255 : 145);
+        }
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               114, 278, 132, 34, 17, 0x111A24);
+    } else if (view == TouchView::kSlider) {
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               68, 101, 224, 70, 24, 0x273443);
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               69, 102, 222, 68, 23, 0x111B27);
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               90, 264, 180, 34, 17, 0x111A24);
+    } else if (view == TouchView::kWallpaper) {
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               58, 28, 244, 46, 22, 0x071019, 185);
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               76, 276, 208, 50, 20, 0x071019, 180);
+    } else if (view == TouchView::kMusic) {
+        for (int row = 0; row < 5; ++row) {
+            const int y = 88 + row * 36;
+            const bool selected = row == selected_row;
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   46, y, 268, 30, 12, selected ? 0x51DDE9 : 0x263443);
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   47, y + 1, 266, 28, 11, selected ? 0x143743 : 0x111B27);
+            if (selected) {
+                FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                       52, y + 7, 4, 16, 2, 0x64EAF4);
+            }
+        }
+        static constexpr std::array<int, 3> control_x = {66, 144, 222};
+        static constexpr std::array<int, 3> control_width = {68, 72, 68};
+        for (size_t i = 0; i < control_x.size(); ++i) {
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   control_x[i], 282, control_width[i], 40, 18,
+                                   i == 1 ? 0x56E0EA : 0x263443);
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   control_x[i] + 1, 283, control_width[i] - 2, 38, 17,
+                                   i == 1 ? 0x116678 : 0x111B27);
+        }
+    } else if (view == TouchView::kPlayback) {
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               58, 28, 150, 48, 22, 0x071019, 205);
+    }
+}
+
+bool EmoteDisplay::InitializeTouchSliderVisual()
+{
+    if (!touch_slider_visual_image_data_.empty()) {
+        return true;
+    }
+    const size_t pixel_count = static_cast<size_t>(kTouchSliderVisualWidth) * kTouchSliderVisualHeight;
+    touch_slider_visual_image_data_.assign(pixel_count * 3, 0);
+    touch_slider_visual_image_.header.magic = C_ARRAY_HEADER_MAGIC;
+    touch_slider_visual_image_.header.cf = GFX_COLOR_FORMAT_RGB565A8;
+    touch_slider_visual_image_.header.flags = 0;
+    touch_slider_visual_image_.header.w = kTouchSliderVisualWidth;
+    touch_slider_visual_image_.header.h = kTouchSliderVisualHeight;
+    touch_slider_visual_image_.header.stride = kTouchSliderVisualWidth * sizeof(uint16_t);
+    touch_slider_visual_image_.header.reserved = 0;
+    touch_slider_visual_image_.data_size = touch_slider_visual_image_data_.size();
+    touch_slider_visual_image_.data = touch_slider_visual_image_data_.data();
+    return true;
+}
+
+void EmoteDisplay::RenderTouchSliderVisual(int value)
+{
+    if (!InitializeTouchSliderVisual()) {
+        return;
+    }
+    value = std::clamp(value, 0, 100);
+    std::fill(touch_slider_visual_image_data_.begin(), touch_slider_visual_image_data_.end(), 0);
+    constexpr int track_x = 10;
+    constexpr int track_width = 260;
+    const int knob_x = track_x + value * track_width / 100;
+    FillTouchUiRoundedRect(touch_slider_visual_image_data_, kTouchSliderVisualWidth,
+                           kTouchSliderVisualHeight, track_x, 16, track_width, 8, 4, 0x2D3948);
+    if (value > 0) {
+        FillTouchUiRoundedRect(touch_slider_visual_image_data_, kTouchSliderVisualWidth,
+                               kTouchSliderVisualHeight, track_x, 16,
+                               std::max(8, knob_x - track_x), 8, 4, 0x58DCE8);
+    }
+    FillTouchUiCircle(touch_slider_visual_image_data_, kTouchSliderVisualWidth,
+                      kTouchSliderVisualHeight, knob_x, 20, 13, 0x081019, 150);
+    FillTouchUiCircle(touch_slider_visual_image_data_, kTouchSliderVisualWidth,
+                      kTouchSliderVisualHeight, knob_x, 20, 10, 0xF2FCFD);
+}
+
 bool EmoteDisplay::EnsureTouchSettingsUi()
 {
     if (!emote_handle_) {
         return false;
     }
-    if (touch_background_ && touch_glow_ && touch_wallpaper_image_ && touch_title_ && touch_back_ && touch_close_ &&
-        touch_footer_ && touch_slider_track_ && touch_slider_fill_ && touch_slider_knob_) {
+    if (touch_background_ && touch_wallpaper_image_ && touch_surface_ &&
+        touch_slider_visual_ && touch_title_ && touch_back_ && touch_close_ && touch_footer_) {
         return true;
     }
 
     touch_background_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
                                                   "touch_background");
-    touch_glow_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_glow");
     // The renderer paints objects in creation order. Keep a dedicated preview
     // above the settings background and below every control.
     touch_wallpaper_image_ = emote_create_obj_by_type(
         emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "touch_wallpaper_image");
+    touch_surface_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "touch_surface");
+    touch_slider_visual_ = emote_create_obj_by_type(
+        emote_handle_, EMOTE_OBJ_TYPE_IMAGE, "touch_slider_visual");
     touch_title_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_title");
     touch_back_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_back");
     touch_close_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_close");
@@ -1823,21 +2075,21 @@ bool EmoteDisplay::EnsureTouchSettingsUi()
         const std::string name = "touch_row_" + std::to_string(i);
         touch_rows_[i] = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, name.c_str());
     }
+    for (size_t i = 0; i < touch_statuses_.size(); ++i) {
+        const std::string name = "touch_status_" + std::to_string(i);
+        touch_statuses_[i] = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, name.c_str());
+    }
     touch_footer_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, "touch_footer");
-    touch_slider_track_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
-                                                   "touch_slider_track");
-    touch_slider_fill_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
-                                                  "touch_slider_fill");
-    touch_slider_knob_ = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL,
-                                                  "touch_slider_knob");
     for (size_t i = 0; i < touch_controls_.size(); ++i) {
         const std::string name = "touch_control_" + std::to_string(i);
         touch_controls_[i] = emote_create_obj_by_type(emote_handle_, EMOTE_OBJ_TYPE_LABEL, name.c_str());
     }
 
-    bool ready = touch_background_ && touch_glow_ && touch_wallpaper_image_ && touch_title_ && touch_back_ && touch_close_ &&
-                 touch_footer_ && touch_slider_track_ && touch_slider_fill_ && touch_slider_knob_;
+    bool ready = touch_background_ && touch_wallpaper_image_ && touch_surface_ &&
+                 touch_slider_visual_ && touch_title_ && touch_back_ && touch_close_ &&
+                 touch_footer_ && InitializeTouchSurface() && InitializeTouchSliderVisual();
     for (auto* row : touch_rows_) ready = ready && row;
+    for (auto* status : touch_statuses_) ready = ready && status;
     for (auto* control : touch_controls_) ready = ready && control;
     if (!ready) {
         ESP_LOGE(TAG, "Unable to create touch settings objects");
@@ -1849,15 +2101,16 @@ bool EmoteDisplay::EnsureTouchSettingsUi()
     gfx_obj_set_size(touch_background_, width_, height_);
     gfx_label_set_text(touch_background_, "");
     gfx_label_set_bg_enable(touch_background_, true);
-    gfx_label_set_bg_color(touch_background_, GFX_COLOR_HEX(0x07101F));
+    gfx_label_set_bg_color(touch_background_, GFX_COLOR_HEX(0x071019));
     gfx_label_set_opa(touch_background_, 255);
-    gfx_obj_set_size(touch_glow_, width_, 126);
-    gfx_label_set_text(touch_glow_, "");
-    gfx_label_set_bg_enable(touch_glow_, true);
-    gfx_label_set_bg_color(touch_glow_, GFX_COLOR_HEX(0x0B2942));
-    gfx_label_set_opa(touch_glow_, 255);
     gfx_obj_set_pos(touch_wallpaper_image_, 0, 0);
     gfx_obj_set_visible(touch_wallpaper_image_, false);
+    gfx_img_set_src(touch_surface_, &touch_surface_image_);
+    gfx_obj_set_pos(touch_surface_, 0, 0);
+    gfx_obj_set_visible(touch_surface_, false);
+    gfx_img_set_src(touch_slider_visual_, &touch_slider_visual_image_);
+    gfx_obj_set_pos(touch_slider_visual_, 40, 182);
+    gfx_obj_set_visible(touch_slider_visual_, false);
 
     auto style_text = [touch_font](gfx_obj_t* obj, gfx_color_t color) {
         gfx_label_set_font(obj, touch_font);
@@ -1865,31 +2118,24 @@ bool EmoteDisplay::EnsureTouchSettingsUi()
         gfx_label_set_text_align(obj, GFX_TEXT_ALIGN_CENTER);
         gfx_label_set_long_mode(obj, GFX_LABEL_LONG_CLIP);
     };
-    style_text(touch_title_, GFX_COLOR_HEX(0xF4F8FF));
-    style_text(touch_back_, GFX_COLOR_HEX(0x62D9FF));
-    style_text(touch_close_, GFX_COLOR_HEX(0xA8B4C8));
-    style_text(touch_footer_, GFX_COLOR_HEX(0xA8B4C8));
+    style_text(touch_title_, GFX_COLOR_HEX(0xF5F8FA));
+    style_text(touch_back_, GFX_COLOR_HEX(0x64EAF4));
+    style_text(touch_close_, GFX_COLOR_HEX(0x9CAABA));
+    style_text(touch_footer_, GFX_COLOR_HEX(0x8392A3));
     for (auto* row : touch_rows_) {
-        style_text(row, GFX_COLOR_HEX(0xF4F8FF));
-        gfx_label_set_bg_enable(row, true);
-        gfx_label_set_bg_color(row, GFX_COLOR_HEX(0x12243A));
-        gfx_label_set_opa(row, 245);
+        style_text(row, GFX_COLOR_HEX(0xF5F8FA));
+        gfx_label_set_bg_enable(row, false);
+    }
+    for (auto* status : touch_statuses_) {
+        style_text(status, GFX_COLOR_HEX(0x91A1B3));
+        gfx_label_set_bg_enable(status, false);
     }
     gfx_label_set_bg_enable(touch_back_, false);
     gfx_label_set_bg_enable(touch_close_, false);
     for (auto* control : touch_controls_) {
-        style_text(control, GFX_COLOR_HEX(0xF4F8FF));
-        gfx_label_set_bg_enable(control, true);
-        gfx_label_set_bg_color(control, GFX_COLOR_HEX(0x1D6F88));
-        gfx_label_set_opa(control, 250);
+        style_text(control, GFX_COLOR_HEX(0xF5F8FA));
+        gfx_label_set_bg_enable(control, false);
     }
-    for (auto* bar : {touch_slider_track_, touch_slider_fill_, touch_slider_knob_}) {
-        gfx_label_set_text(bar, "");
-        gfx_label_set_bg_enable(bar, true);
-    }
-    gfx_label_set_bg_color(touch_slider_track_, GFX_COLOR_HEX(0x3B465C));
-    gfx_label_set_bg_color(touch_slider_fill_, GFX_COLOR_HEX(0x62D9FF));
-    gfx_label_set_bg_color(touch_slider_knob_, GFX_COLOR_HEX(0xF4F8FF));
     emote_unlock(emote_handle_);
     HideTouchObjects();
     return true;
@@ -1901,13 +2147,18 @@ void EmoteDisplay::HideTouchObjects()
         return;
     }
     emote_lock(emote_handle_);
-    for (auto* obj : {touch_background_, touch_glow_, touch_wallpaper_image_, touch_title_, touch_back_, touch_close_, touch_footer_,
-                      touch_slider_track_, touch_slider_fill_, touch_slider_knob_}) {
-        gfx_obj_set_visible(obj, false);
+    for (auto* obj : {touch_background_, touch_wallpaper_image_, touch_surface_,
+                      touch_slider_visual_, touch_title_, touch_back_, touch_close_, touch_footer_}) {
+        if (obj && gfx_obj_get_visible(obj)) gfx_obj_set_visible(obj, false);
     }
-    for (auto* row : touch_rows_) gfx_obj_set_visible(row, false);
-    for (auto* control : touch_controls_) gfx_obj_set_visible(control, false);
-    if (touch_music_return_) gfx_obj_set_visible(touch_music_return_, false);
+    for (auto* row : touch_rows_)
+        if (gfx_obj_get_visible(row)) gfx_obj_set_visible(row, false);
+    for (auto* status : touch_statuses_)
+        if (gfx_obj_get_visible(status)) gfx_obj_set_visible(status, false);
+    for (auto* control : touch_controls_)
+        if (gfx_obj_get_visible(control)) gfx_obj_set_visible(control, false);
+    if (touch_music_return_ && gfx_obj_get_visible(touch_music_return_))
+        gfx_obj_set_visible(touch_music_return_, false);
     emote_unlock(emote_handle_);
     touch_view_ = TouchView::kNone;
     touch_menu_offset_ = 1;
@@ -1940,12 +2191,17 @@ void EmoteDisplay::UpdateTouchMenuOffset(int reveal_height)
     if (offset == touch_menu_offset_) return;
     emote_lock(emote_handle_);
     gfx_obj_set_pos(touch_background_, 0, offset);
-    gfx_obj_set_pos(touch_glow_, 0, offset);
-    gfx_obj_set_pos(touch_title_, 95, 35 + offset);
-    gfx_obj_set_pos(touch_close_, 246, 37 + offset);
-    for (size_t i = 0; i < 4; ++i)
-        gfx_obj_set_pos(touch_rows_[i], 50, 78 + static_cast<int>(i) * 49 + offset);
-    gfx_obj_set_pos(touch_footer_, 55, 282 + offset);
+    gfx_obj_set_pos(touch_surface_, 0, offset);
+    gfx_obj_set_pos(touch_title_, 110, 34 + offset);
+    gfx_obj_set_pos(touch_close_, 255, 36 + offset);
+    static constexpr std::array<std::array<int, 2>, 4> label_positions = {{
+        {52, 102}, {193, 102}, {52, 194}, {193, 194},
+    }};
+    for (size_t i = 0; i < 4; ++i) {
+        gfx_obj_set_pos(touch_rows_[i], label_positions[i][0], label_positions[i][1] + offset);
+        gfx_obj_set_pos(touch_statuses_[i], label_positions[i][0], label_positions[i][1] + 29 + offset);
+    }
+    gfx_obj_set_pos(touch_footer_, 105, 281 + offset);
     emote_unlock(emote_handle_);
     touch_menu_offset_ = offset;
 }
@@ -1967,29 +2223,34 @@ void EmoteDisplay::ShowTouchMenu(int reveal_height, const char* volume,
             "音量", "亮度", "壁纸", "音乐",
         };
         const std::array<const char*, 4> states = {volume, brightness, wallpaper, music};
-        static constexpr std::array<uint32_t, 4> colors = {
-            0x123A50, 0x3A3420, 0x30284D, 0x16384A,
-        };
+        RenderTouchSurface(TouchView::kMenu);
         emote_lock(emote_handle_);
         gfx_label_set_opa(touch_background_, 255);
         gfx_obj_set_visible(touch_background_, true);
-        gfx_obj_set_visible(touch_glow_, true);
-        gfx_obj_set_size(touch_title_, 170, 38);
+        gfx_img_set_src(touch_surface_, &touch_surface_image_);
+        gfx_obj_set_visible(touch_surface_, true);
+        gfx_obj_set_size(touch_title_, 140, 32);
+        gfx_label_set_font(touch_title_, EnsureCommonTextFont());
         gfx_label_set_text(touch_title_, "控制中心");
         gfx_obj_set_visible(touch_title_, true);
-        gfx_obj_set_size(touch_close_, 64, 38);
+        gfx_obj_set_size(touch_close_, 62, 32);
         gfx_label_set_text(touch_close_, "关闭");
         gfx_obj_set_visible(touch_close_, true);
         for (size_t i = 0; i < 4; ++i) {
-            std::string label = defaults[i];
-            if (states[i] && states[i][0]) label += "  ·  " + std::string(states[i]);
-            gfx_label_set_bg_color(touch_rows_[i], GFX_COLOR_HEX(colors[i]));
-            gfx_label_set_opa(touch_rows_[i], 245);
-            gfx_obj_set_size(touch_rows_[i], 260, 41);
-            gfx_label_set_text(touch_rows_[i], label.c_str());
+            gfx_label_set_font(touch_rows_[i], EnsureCommonTextFont());
+            gfx_label_set_color(touch_rows_[i], GFX_COLOR_HEX(0xF5F8FA));
+            gfx_label_set_bg_enable(touch_rows_[i], false);
+            gfx_obj_set_size(touch_rows_[i], 115, 27);
+            gfx_label_set_text(touch_rows_[i], defaults[i]);
             gfx_obj_set_visible(touch_rows_[i], true);
+            gfx_obj_set_size(touch_statuses_[i], 115, 27);
+            const std::string state = states[i] && states[i][0]
+                                          ? TruncateTouchText(states[i], 105)
+                                          : "--";
+            gfx_label_set_text(touch_statuses_[i], state.c_str());
+            gfx_obj_set_visible(touch_statuses_[i], true);
         }
-        gfx_obj_set_size(touch_footer_, 250, 28);
+        gfx_obj_set_size(touch_footer_, 150, 27);
         gfx_label_set_text(touch_footer_, "上滑收起");
         gfx_obj_set_visible(touch_footer_, true);
         emote_unlock(emote_handle_);
@@ -2013,36 +2274,39 @@ void EmoteDisplay::ShowTouchSlider(const char* title, int value)
     touch_view_ = TouchView::kSlider;
     touch_slider_title_ = requested_title;
     touch_settings_visible_ = true;
+    RenderTouchSurface(TouchView::kSlider);
+    RenderTouchSliderVisual(value);
     emote_lock(emote_handle_);
     gfx_label_set_opa(touch_background_, 255);
     gfx_obj_set_pos(touch_background_, 0, 0);
     gfx_obj_set_visible(touch_background_, true);
-    gfx_obj_set_size(touch_back_, 86, 40);
-    gfx_obj_set_pos(touch_back_, 52, 42);
-    gfx_label_set_text(touch_back_, "<  返回");
+    gfx_img_set_src(touch_surface_, &touch_surface_image_);
+    gfx_obj_set_pos(touch_surface_, 0, 0);
+    gfx_obj_set_visible(touch_surface_, true);
+    gfx_img_set_src(touch_slider_visual_, &touch_slider_visual_image_);
+    gfx_obj_set_size(touch_slider_visual_, kTouchSliderVisualWidth, kTouchSliderVisualHeight);
+    gfx_obj_set_pos(touch_slider_visual_, 40, 182);
+    gfx_obj_set_visible(touch_slider_visual_, true);
+    gfx_obj_set_size(touch_back_, 80, 36);
+    gfx_obj_set_pos(touch_back_, 68, 40);
+    gfx_label_set_text(touch_back_, "< 返回");
     gfx_obj_set_visible(touch_back_, true);
-    gfx_obj_set_size(touch_title_, 150, 40);
-    gfx_obj_set_pos(touch_title_, 136, 42);
+    gfx_obj_set_size(touch_title_, 112, 36);
+    gfx_obj_set_pos(touch_title_, 140, 40);
+    gfx_label_set_font(touch_title_, EnsureCommonTextFont());
     gfx_label_set_text(touch_title_, title ? title : "设置");
     gfx_obj_set_visible(touch_title_, true);
-    gfx_label_set_bg_color(touch_rows_[0], GFX_COLOR_HEX(0x152438));
-    gfx_label_set_opa(touch_rows_[0], 210);
-    gfx_obj_set_size(touch_rows_[0], 180, 64);
-    gfx_obj_set_pos(touch_rows_[0], 90, 102);
+    gfx_label_set_bg_enable(touch_rows_[0], false);
+    gfx_label_set_font(touch_rows_[0], static_cast<gfx_font_t>(
+        const_cast<lv_font_t*>(&font_puhui_basic_30_4)));
+    gfx_label_set_color(touch_rows_[0], GFX_COLOR_HEX(0xF5FBFC));
+    gfx_obj_set_size(touch_rows_[0], 180, 48);
+    gfx_obj_set_pos(touch_rows_[0], 90, 112);
     gfx_label_set_text(touch_rows_[0], "");
     gfx_obj_set_visible(touch_rows_[0], true);
-    gfx_obj_set_size(touch_slider_track_, 270, 14);
-    gfx_obj_set_pos(touch_slider_track_, 45, 190);
-    gfx_obj_set_visible(touch_slider_track_, true);
-    gfx_obj_set_size(touch_slider_fill_, 1, 14);
-    gfx_obj_set_pos(touch_slider_fill_, 45, 190);
-    gfx_obj_set_visible(touch_slider_fill_, true);
-    gfx_obj_set_size(touch_slider_knob_, 28, 28);
-    gfx_obj_set_pos(touch_slider_knob_, 31, 183);
-    gfx_obj_set_visible(touch_slider_knob_, true);
-    gfx_obj_set_size(touch_footer_, 280, 32);
-    gfx_obj_set_pos(touch_footer_, 40, 242);
-    gfx_label_set_text(touch_footer_, "拖动滑块，松手后保存");
+    gfx_obj_set_size(touch_footer_, 180, 28);
+    gfx_obj_set_pos(touch_footer_, 90, 267);
+    gfx_label_set_text(touch_footer_, "松手后自动保存");
     gfx_obj_set_visible(touch_footer_, true);
     emote_unlock(emote_handle_);
     touch_slider_value_ = -1;
@@ -2054,11 +2318,10 @@ void EmoteDisplay::UpdateTouchSliderValue(int value)
     if (!emote_handle_ || touch_view_ != TouchView::kSlider) return;
     value = std::clamp(value, 0, 100);
     if (value == touch_slider_value_) return;
-    const int fill_width = std::max(1, value * 270 / 100);
+    RenderTouchSliderVisual(value);
     emote_lock(emote_handle_);
     gfx_label_set_text_fmt(touch_rows_[0], "%d%%", value);
-    gfx_obj_set_size(touch_slider_fill_, fill_width, 14);
-    gfx_obj_set_pos(touch_slider_knob_, 45 + fill_width - 14, 183);
+    gfx_img_set_src(touch_slider_visual_, &touch_slider_visual_image_);
     emote_unlock(emote_handle_);
     touch_slider_value_ = value;
 }
@@ -2100,6 +2363,7 @@ bool EmoteDisplay::ShowTouchWallpaper(int index)
     SetWallpaperNativeUiVisible(false);
     const std::string name = GetTouchWallpaperName(index);
     const int count = GetTouchWallpaperCount();
+    RenderTouchSurface(TouchView::kWallpaper);
     emote_lock(emote_handle_);
     gfx_obj_set_visible(wallpaper_image_, false);
     gfx_obj_set_visible(wallpaper_fade_, false);
@@ -2109,24 +2373,30 @@ bool EmoteDisplay::ShowTouchWallpaper(int index)
     gfx_img_set_src(touch_wallpaper_image_, &wallpaper_image_dsc_);
     gfx_obj_set_pos(touch_wallpaper_image_, 0, 0);
     gfx_obj_set_visible(touch_wallpaper_image_, true);
+    gfx_img_set_src(touch_surface_, &touch_surface_image_);
+    gfx_obj_set_pos(touch_surface_, 0, 0);
+    gfx_obj_set_visible(touch_surface_, true);
     gfx_label_set_bg_enable(touch_back_, false);
-    gfx_obj_set_size(touch_back_, 86, 36);
-    gfx_obj_set_pos(touch_back_, 48, 42);
-    gfx_label_set_text(touch_back_, "<  返回");
+    gfx_obj_set_size(touch_back_, 78, 32);
+    gfx_obj_set_pos(touch_back_, 75, 35);
+    gfx_label_set_text(touch_back_, "< 返回");
     gfx_obj_set_visible(touch_back_, true);
-    gfx_obj_set_size(touch_title_, 130, 36);
-    gfx_obj_set_pos(touch_title_, 135, 42);
-    gfx_label_set_text(touch_title_, "壁纸预览");
+    gfx_obj_set_size(touch_title_, 80, 32);
+    gfx_obj_set_pos(touch_title_, 140, 35);
+    gfx_label_set_font(touch_title_, EnsureCommonTextFont());
+    gfx_label_set_text(touch_title_, "壁纸");
     gfx_obj_set_visible(touch_title_, true);
-    gfx_label_set_bg_color(touch_rows_[0], GFX_COLOR_HEX(0x071421));
-    gfx_label_set_opa(touch_rows_[0], 175);
-    gfx_obj_set_size(touch_rows_[0], 190, 34);
-    gfx_obj_set_pos(touch_rows_[0], 85, 266);
-    gfx_label_set_text(touch_rows_[0], name.c_str());
+    gfx_label_set_bg_enable(touch_rows_[0], false);
+    gfx_label_set_font(touch_rows_[0], EnsureCommonTextFont());
+    gfx_label_set_color(touch_rows_[0], GFX_COLOR_HEX(0xF5F8FA));
+    gfx_obj_set_size(touch_rows_[0], 180, 25);
+    gfx_obj_set_pos(touch_rows_[0], 90, 278);
+    const std::string display_name = TruncateTouchText(name, 170);
+    gfx_label_set_text(touch_rows_[0], display_name.c_str());
     gfx_obj_set_visible(touch_rows_[0], true);
-    gfx_obj_set_size(touch_footer_, 220, 26);
-    gfx_obj_set_pos(touch_footer_, 70, 302);
-    gfx_label_set_text_fmt(touch_footer_, "%d/%d  左右滑 · 点按", index + 1, count);
+    gfx_obj_set_size(touch_footer_, 220, 23);
+    gfx_obj_set_pos(touch_footer_, 70, 301);
+    gfx_label_set_text_fmt(touch_footer_, "%d/%d · 滑动 · 点按应用", index + 1, count);
     gfx_obj_set_visible(touch_footer_, true);
     emote_unlock(emote_handle_);
     return true;
@@ -2155,49 +2425,47 @@ void EmoteDisplay::ShowTouchMusic(const std::vector<std::string>& titles, int fi
         touch_view_ = TouchView::kMusic;
     }
     touch_settings_visible_ = true;
+    RenderTouchSurface(TouchView::kMusic, selected_index - first_index);
     emote_lock(emote_handle_);
+    gfx_img_set_src(touch_surface_, &touch_surface_image_);
+    gfx_obj_set_pos(touch_surface_, 0, 0);
+    gfx_obj_set_visible(touch_surface_, true);
     if (initialize) {
         gfx_label_set_opa(touch_background_, 255);
         gfx_obj_set_pos(touch_background_, 0, 0);
         gfx_obj_set_visible(touch_background_, true);
-        gfx_obj_set_size(touch_glow_, width_, 112);
-        gfx_obj_set_pos(touch_glow_, 0, 0);
-        gfx_obj_set_visible(touch_glow_, true);
-        gfx_obj_set_size(touch_back_, 86, 40);
-        gfx_obj_set_pos(touch_back_, 48, 35);
-        gfx_label_set_text(touch_back_, "<  返回");
+        gfx_obj_set_size(touch_back_, 80, 36);
+        gfx_obj_set_pos(touch_back_, 68, 37);
+        gfx_label_set_text(touch_back_, "< 返回");
         gfx_obj_set_visible(touch_back_, true);
-        gfx_obj_set_size(touch_title_, 150, 40);
-        gfx_obj_set_pos(touch_title_, 136, 35);
-        gfx_label_set_text(touch_title_, "音乐列表");
+        gfx_obj_set_size(touch_title_, 100, 36);
+        gfx_obj_set_pos(touch_title_, 140, 37);
+        gfx_label_set_font(touch_title_, EnsureCommonTextFont());
+        gfx_label_set_text(touch_title_, "音乐");
         gfx_obj_set_visible(touch_title_, true);
     }
     for (size_t row = 0; row < touch_rows_.size(); ++row) {
+        auto* row_label = touch_rows_[row];
         const int index = first_index + static_cast<int>(row);
         if (initialize) {
-            gfx_obj_set_size(touch_rows_[row], 264, 36);
-            gfx_obj_set_pos(touch_rows_[row], 48, 78 + static_cast<int>(row) * 40);
+            gfx_obj_set_size(row_label, 242, 30);
+            gfx_obj_set_pos(row_label, 59, 88 + static_cast<int>(row) * 36);
         }
         if (index >= 0 && index < static_cast<int>(titles.size())) {
-            const std::string label = (index == selected_index ? "●  " : "    ") + titles[index];
-            const bool visible_changed = !touch_row_visible_[row];
-            if (initialize || touch_row_text_[row] != label || visible_changed) {
-                gfx_label_set_text(touch_rows_[row], label.c_str());
-                gfx_label_set_bg_color(touch_rows_[row], GFX_COLOR_HEX(
-                    index == selected_index ? 0x0A88A8 : 0x12243A));
-                gfx_obj_set_visible(touch_rows_[row], true);
-                touch_row_text_[row] = label;
-                touch_row_visible_[row] = true;
-            }
+            const std::string label = TruncateTouchText(titles[index], 230);
+            gfx_label_set_text(row_label, label.c_str());
+            gfx_obj_set_visible(row_label, true);
+            touch_row_visible_[row] = true;
+            gfx_label_set_color(row_label, GFX_COLOR_HEX(
+                index == selected_index ? 0xF5FCFD : 0xC4CEDA));
         } else {
-            if (touch_row_visible_[row]) gfx_obj_set_visible(touch_rows_[row], false);
+            if (touch_row_visible_[row]) gfx_obj_set_visible(row_label, false);
             touch_row_visible_[row] = false;
-            touch_row_text_[row].clear();
         }
     }
     if (titles.empty() && status && status[0]) {
-        gfx_obj_set_size(touch_rows_[0], 256, 90);
-        gfx_obj_set_pos(touch_rows_[0], 52, 120);
+        // The library scan completes asynchronously and the next update is incremental,
+        // so row 0 must keep the same geometry used by populated lists.
         gfx_label_set_text(touch_rows_[0], status);
         gfx_obj_set_visible(touch_rows_[0], true);
     }
@@ -2206,8 +2474,8 @@ void EmoteDisplay::ShowTouchMusic(const std::vector<std::string>& titles, int fi
             "上一首", primary_control && primary_control[0] ? primary_control : "播放", "下一首"};
         for (size_t i = 0; i < touch_controls_.size(); ++i) {
             gfx_obj_set_size(touch_controls_[i], i == 1 ? 72 : 66, 40);
-            gfx_obj_set_pos(touch_controls_[i], 68 + static_cast<int>(i) * 78, 286);
-            gfx_label_set_bg_color(touch_controls_[i], GFX_COLOR_HEX(i == 1 ? 0x00A7C7 : 0x174157));
+            gfx_obj_set_pos(touch_controls_[i], 68 + static_cast<int>(i) * 78, 282);
+            gfx_label_set_bg_enable(touch_controls_[i], false);
             gfx_label_set_text(touch_controls_[i], controls[i]);
             gfx_obj_set_visible(touch_controls_[i], true);
         }
@@ -2230,6 +2498,7 @@ void EmoteDisplay::ShowTouchMusicPlayback()
     touch_settings_visible_ = true;
     touch_music_overlay_suppressed_ = false;
     SetMusicOverlayVisible(true);
+    RenderTouchSurface(TouchView::kPlayback);
 
     if (!touch_music_return_) {
         touch_music_return_ = emote_create_obj_by_type(
@@ -2248,9 +2517,12 @@ void EmoteDisplay::ShowTouchMusicPlayback()
     }
 
     emote_lock(emote_handle_);
+    gfx_img_set_src(touch_surface_, &touch_surface_image_);
+    gfx_obj_set_pos(touch_surface_, 0, 0);
+    gfx_obj_set_visible(touch_surface_, true);
     gfx_obj_set_size(touch_music_return_, 126, 38);
-    gfx_obj_set_pos(touch_music_return_, 38, 34);
-    gfx_label_set_text(touch_music_return_, "<  音乐列表");
+    gfx_obj_set_pos(touch_music_return_, 69, 33);
+    gfx_label_set_text(touch_music_return_, "< 音乐列表");
     gfx_obj_set_visible(touch_music_return_, true);
     emote_unlock(emote_handle_);
 }

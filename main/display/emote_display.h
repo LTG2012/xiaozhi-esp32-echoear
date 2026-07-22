@@ -133,16 +133,19 @@ private:
     static constexpr size_t kTouchRowCount = 5;
     static constexpr size_t kTouchControlCount = 3;
     gfx_obj_t* touch_background_ = nullptr;
-    gfx_obj_t* touch_glow_ = nullptr;
     gfx_obj_t* touch_wallpaper_image_ = nullptr;
+    gfx_obj_t* touch_surface_ = nullptr;
+    gfx_image_dsc_t touch_surface_image_ = {};
+    std::vector<uint8_t> touch_surface_image_data_;
+    gfx_obj_t* touch_slider_visual_ = nullptr;
+    gfx_image_dsc_t touch_slider_visual_image_ = {};
+    std::vector<uint8_t> touch_slider_visual_image_data_;
     gfx_obj_t* touch_title_ = nullptr;
     gfx_obj_t* touch_back_ = nullptr;
     gfx_obj_t* touch_close_ = nullptr;
     std::array<gfx_obj_t*, kTouchRowCount> touch_rows_ = {};
+    std::array<gfx_obj_t*, 4> touch_statuses_ = {};
     gfx_obj_t* touch_footer_ = nullptr;
-    gfx_obj_t* touch_slider_track_ = nullptr;
-    gfx_obj_t* touch_slider_fill_ = nullptr;
-    gfx_obj_t* touch_slider_knob_ = nullptr;
     gfx_obj_t* touch_music_return_ = nullptr;
     std::array<gfx_obj_t*, kTouchControlCount> touch_controls_ = {};
     bool touch_settings_visible_ = false;
@@ -154,7 +157,6 @@ private:
     int touch_menu_offset_ = 1;
     int touch_slider_value_ = -1;
     std::string touch_slider_title_;
-    std::array<std::string, kTouchRowCount> touch_row_text_;
     std::array<bool, kTouchRowCount> touch_row_visible_ = {};
     std::string touch_primary_control_;
 
@@ -183,6 +185,10 @@ private:
     void LoadWallpaperSettings();
     void SaveWallpaperSettings();
     bool EnsureTouchSettingsUi();
+    bool InitializeTouchSurface();
+    void RenderTouchSurface(TouchView view, int selected_row = -1);
+    bool InitializeTouchSliderVisual();
+    void RenderTouchSliderVisual(int value);
     void HideTouchObjects();
     void UpdateTouchMenuOffset(int reveal_height);
     void RestoreTouchWallpaperPreview();
