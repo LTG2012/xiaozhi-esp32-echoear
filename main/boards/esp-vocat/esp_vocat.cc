@@ -11,6 +11,7 @@
 #include "sd_card_manager.h"
 #include "sd_music_player.h"
 #include "media_transfer_server.h"
+#include "settings.h"
 
 #include <esp_log.h>
 #include <esp_err.h>
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <mutex>
 
 #include <driver/i2c_master.h>
 #include <cstdlib>
@@ -44,6 +46,7 @@ extern "C" {
 
 namespace Bmi270Motion {
 static bmi270_handle_t bmi_handle_ = nullptr;
+static float accel_range_g_ = 2.0f;
 
 esp_err_t Initialize(i2c_bus_handle_t i2c_bus)
 {
@@ -68,6 +71,17 @@ esp_err_t Initialize(i2c_bus_handle_t i2c_bus)
         return ESP_FAIL;
     }
 
+    struct bmi2_sens_config config = {};
+    config.type = BMI2_ACCEL;
+    if (bmi2_get_sensor_config(&config, 1, bmi_handle_) == BMI2_OK) {
+        switch (config.cfg.acc.range) {
+        case BMI2_ACC_RANGE_4G: accel_range_g_ = 4.0f; break;
+        case BMI2_ACC_RANGE_8G: accel_range_g_ = 8.0f; break;
+        case BMI2_ACC_RANGE_16G: accel_range_g_ = 16.0f; break;
+        default: accel_range_g_ = 2.0f; break;
+        }
+    }
+
     ESP_LOGI(TAG, "BMI270 initialized");
     return ESP_OK;
 }
@@ -79,6 +93,11 @@ bool ReadAccelRaw(struct bmi2_sens_data& accel)
     }
     int8_t rslt = bmi2_get_sensor_data(&accel, bmi_handle_);
     return rslt == BMI2_OK;
+}
+
+int RawToMilliG(int16_t raw)
+{
+    return static_cast<int>(static_cast<float>(raw) * accel_range_g_ * 1000.0f / 32768.0f);
 }
 } // namespace Bmi270Motion
 
@@ -288,6 +307,7 @@ public:
         bool discharging = false;
         int voltage_mv = 0;
         int current_ma = 0;
+        int64_t updated_us = 0;
     };
 
     static constexpr uint8_t kRegVoltage = 0x08;
@@ -333,6 +353,7 @@ public:
         }
         info.voltage_mv = static_cast<uint16_t>(voltage);
         info.current_ma = current;
+        info.updated_us = esp_timer_get_time();
         info.discharging = (static_cast<uint16_t>(status) & kBatteryStatusDsg) != 0;
         info.charging = !info.discharging || average_current > kChargingCurrentMa || current > kChargingCurrentMa;
 
@@ -430,6 +451,10 @@ private:
         kWallpaper,
         kMusic,
         kMusicPlayback,
+        kMediaTransfer,
+        kMotion,
+        kAec,
+        kBattery,
     };
     TouchPage touch_page_ = TouchPage::kHidden;
     bool screen_touch_down_ = false;
@@ -452,6 +477,25 @@ private:
     int rendered_music_first_index_ = -1;
     int rendered_music_selected_index_ = -2;
     std::array<std::string, 4> touch_menu_status_;
+    int touch_menu_group_ = 0;
+    int64_t touch_page_refresh_us_ = 0;
+    std::atomic<bool> media_operation_pending_{false};
+    std::atomic<bool> media_start_requested_{false};
+    std::atomic<bool> media_started_from_touch_{false};
+    std::mutex media_result_mutex_;
+    std::string media_result_;
+
+    struct MotionSnapshot {
+        int x_mg = 0;
+        int y_mg = 0;
+        int z_mg = 0;
+        int64_t updated_us = 0;
+        uint32_t revision = 0;
+        bool valid = false;
+    };
+    portMUX_TYPE motion_lock_ = portMUX_INITIALIZER_UNLOCKED;
+    MotionSnapshot motion_snapshot_;
+    uint32_t rendered_motion_revision_ = 0;
 
     static void emotion_reset_timer_callback(void* arg)
     {
@@ -581,7 +625,8 @@ private:
     {
         auto* self = static_cast<EspVocat*>(arg);
         while (true) {
-            if (self != nullptr && self->charge_ != nullptr && !self->touch_ui_busy_.load()) {
+            if (self != nullptr && self->charge_ != nullptr && !self->screen_touch_down_ &&
+                (!self->touch_ui_busy_.load() || self->touch_page_ == TouchPage::kBattery)) {
                 if (self->charge_->Update()) {
                     self->HandleBatteryEmotions();
                 }
@@ -606,14 +651,25 @@ private:
         constexpr int64_t kShakeCooldownMs = 2000;
 
         while (true) {
-            if (self->touch_ui_busy_.load()) {
+            const bool motion_page = self->touch_page_ == TouchPage::kMotion;
+            if (self->screen_touch_down_ || (self->touch_ui_busy_.load() && !motion_page)) {
                 has_prev = false;
                 vTaskDelay(pdMS_TO_TICKS(80));
                 continue;
             }
             const bool read_ok = Bmi270Motion::ReadAccelRaw(cur);
             if (read_ok) {
-                if (has_prev) {
+                MotionSnapshot snapshot;
+                snapshot.x_mg = Bmi270Motion::RawToMilliG(cur.acc.x);
+                snapshot.y_mg = Bmi270Motion::RawToMilliG(cur.acc.y);
+                snapshot.z_mg = Bmi270Motion::RawToMilliG(cur.acc.z);
+                snapshot.updated_us = esp_timer_get_time();
+                snapshot.valid = true;
+                taskENTER_CRITICAL(&self->motion_lock_);
+                snapshot.revision = self->motion_snapshot_.revision + 1;
+                self->motion_snapshot_ = snapshot;
+                taskEXIT_CRITICAL(&self->motion_lock_);
+                if (has_prev && !motion_page) {
                     int dx = abs(static_cast<int>(cur.acc.x) - static_cast<int>(prev.acc.x));
                     int dy = abs(static_cast<int>(cur.acc.y) - static_cast<int>(prev.acc.y));
                     int dz = abs(static_cast<int>(cur.acc.z) - static_cast<int>(prev.acc.z));
@@ -741,6 +797,10 @@ private:
             case TouchPage::kWallpaper: return "wallpaper";
             case TouchPage::kMusic: return "music";
             case TouchPage::kMusicPlayback: return "music_playback";
+            case TouchPage::kMediaTransfer: return "media_transfer";
+            case TouchPage::kMotion: return "motion";
+            case TouchPage::kAec: return "aec";
+            case TouchPage::kBattery: return "battery";
         }
         return "unknown";
     }
@@ -790,9 +850,120 @@ private:
         music_ui_refresh_us_ = esp_timer_get_time();
     }
 
+    static void media_transfer_task(void* arg)
+    {
+        auto* self = static_cast<EspVocat*>(arg);
+        if (self != nullptr && self->media_transfer_) {
+            const bool start = self->media_start_requested_.load();
+            const std::string result = start ? self->media_transfer_->StartForTouch()
+                                             : self->media_transfer_->StopForTouch();
+            std::string display_result;
+            const auto snapshot = self->media_transfer_->GetSnapshot();
+            if (start) {
+                self->media_started_from_touch_.store(snapshot.running && snapshot.touch_owned);
+            } else {
+                self->media_started_from_touch_.store(false);
+            }
+            if (snapshot.running) {
+                display_result = "媒体传输已开启";
+            } else if (result.find("Wi-Fi") != std::string::npos) {
+                display_result = "Wi-Fi 未连接";
+            } else if (result.find("SD") != std::string::npos ||
+                       result.find("mount") != std::string::npos) {
+                display_result = "SD 卡不可用";
+            } else if (start) {
+                display_result = "无法启动媒体传输";
+            } else {
+                display_result = "媒体传输已关闭";
+            }
+            std::lock_guard<std::mutex> lock(self->media_result_mutex_);
+            self->media_result_ = display_result;
+        }
+        if (self != nullptr) self->media_operation_pending_.store(false);
+        vTaskDelete(nullptr);
+    }
+
+    void QueueMediaOperation(bool start)
+    {
+        if (!media_transfer_ || media_operation_pending_.exchange(true)) return;
+        media_start_requested_.store(start);
+        {
+            std::lock_guard<std::mutex> lock(media_result_mutex_);
+            media_result_ = start ? "正在启动媒体传输" : "正在关闭媒体传输";
+        }
+        if (xTaskCreatePinnedToCore(media_transfer_task, "mediaTouch", 5 * 1024, this, 4,
+                                    nullptr, 0) != pdPASS) {
+            media_operation_pending_.store(false);
+            std::lock_guard<std::mutex> lock(media_result_mutex_);
+            media_result_ = "无法创建媒体任务";
+        }
+    }
+
+    void RenderMediaTransferPage()
+    {
+        auto* emote_display = TouchDisplay();
+        if (!emote_display) return;
+        MediaTransferServer::Snapshot snapshot;
+        if (media_transfer_) snapshot = media_transfer_->GetSnapshot();
+        std::string result;
+        {
+            std::lock_guard<std::mutex> lock(media_result_mutex_);
+            result = media_result_;
+        }
+        emote_display->ShowTouchMediaTransfer(snapshot.running, media_operation_pending_.load(),
+                                              snapshot.url.c_str(), result.c_str());
+    }
+
+    void RenderMotionPage(bool force = false)
+    {
+        auto* emote_display = TouchDisplay();
+        if (!emote_display) return;
+        MotionSnapshot snapshot;
+        taskENTER_CRITICAL(&motion_lock_);
+        snapshot = motion_snapshot_;
+        taskEXIT_CRITICAL(&motion_lock_);
+        if (!force && snapshot.revision == rendered_motion_revision_) return;
+        const int64_t age_us = snapshot.updated_us == 0 ? INT64_MAX : esp_timer_get_time() - snapshot.updated_us;
+        const bool valid = snapshot.valid && age_us <= 1000 * 1000;
+        const char* status = !bmi270_ready_ ? "传感器不可用"
+                             : !valid ? screen_touch_down_ ? "数据已暂停" : "等待传感器数据"
+                                      : "实时加速度 · 松手刷新";
+        emote_display->ShowTouchMotion(snapshot.x_mg, snapshot.y_mg, snapshot.z_mg, valid, status);
+        rendered_motion_revision_ = snapshot.revision;
+    }
+
+    void RenderAecPage()
+    {
+        if (auto* emote_display = TouchDisplay()) {
+            emote_display->ShowTouchAec(Application::GetInstance().GetAecMode() == kAecOnDeviceSide);
+        }
+    }
+
+    void RenderBatteryPage()
+    {
+        if (auto* emote_display = TouchDisplay()) {
+            Charge::BatteryInfo info;
+            const bool available = charge_ != nullptr && charge_->GetBatteryInfo(info) &&
+                info.updated_us != 0 && esp_timer_get_time() - info.updated_us <= 3 * 1000 * 1000;
+            emote_display->ShowTouchBattery(info.level, info.voltage_mv, info.current_ma,
+                                            info.charging, info.discharging, available);
+        }
+    }
+
+    void StopTouchMediaIfOwned()
+    {
+        if (media_transfer_) {
+            const auto snapshot = media_transfer_->GetSnapshot();
+            if (snapshot.running && (snapshot.touch_owned || media_started_from_touch_.load())) {
+                QueueMediaOperation(false);
+            }
+        }
+    }
+
     void CloseTouchSettings()
     {
         ESP_LOGI(TAG, "Touch UI close from page=%s", TouchPageName(touch_page_));
+        StopTouchMediaIfOwned();
         if (auto* emote_display = TouchDisplay()) {
             emote_display->HideTouchSettings();
         }
@@ -804,7 +975,10 @@ private:
     void ShowTouchMenu(int reveal_height = DISPLAY_HEIGHT)
     {
         if (auto* emote_display = TouchDisplay()) {
-            if (touch_page_ != TouchPage::kMenu && touch_page_ != TouchPage::kPulling) {
+            if (touch_page_ == TouchPage::kHidden) {
+                touch_menu_group_ = 0;
+            }
+            if (touch_menu_group_ == 0) {
                 touch_menu_status_[0] = std::to_string(GetAudioCodec()->output_volume()) + "%";
                 touch_menu_status_[1] = std::to_string(backlight_ ? backlight_->brightness() : 75) + "%";
                 touch_menu_status_[2] = emote_display->GetTouchWallpaperName(
@@ -816,8 +990,24 @@ private:
                     if (index >= 0 && index < static_cast<int>(snapshot.titles.size()))
                         touch_menu_status_[3] = snapshot.titles[index];
                 }
+            } else {
+                const auto media = media_transfer_ ? media_transfer_->GetSnapshot()
+                                                   : MediaTransferServer::Snapshot{};
+                touch_menu_status_[0] = media.running ? "传输中" : "已关闭";
+                touch_menu_status_[1] = bmi270_ready_ ? "点击查看" : "未检测";
+                touch_menu_status_[2] = Application::GetInstance().GetAecMode() == kAecOnDeviceSide
+                    ? "已开启" : "已关闭";
+                Charge::BatteryInfo info;
+                if (charge_ && charge_->GetBatteryInfo(info)) {
+                    char battery[32];
+                    std::snprintf(battery, sizeof(battery), "%d%% · %d.%02dV", info.level,
+                                  info.voltage_mv / 1000, std::abs(info.voltage_mv % 1000) / 10);
+                    touch_menu_status_[3] = battery;
+                } else {
+                    touch_menu_status_[3] = "不可用";
+                }
             }
-            emote_display->ShowTouchMenu(reveal_height, touch_menu_status_[0].c_str(),
+            emote_display->ShowTouchMenu(reveal_height, touch_menu_group_, touch_menu_status_[0].c_str(),
                                          touch_menu_status_[1].c_str(), touch_menu_status_[2].c_str(),
                                          touch_menu_status_[3].c_str());
             touch_page_ = reveal_height >= DISPLAY_HEIGHT ? TouchPage::kMenu : TouchPage::kPulling;
@@ -841,7 +1031,26 @@ private:
     {
         auto* emote_display = TouchDisplay();
         if (!emote_display) return;
-        ESP_LOGI(TAG, "Touch UI menu select row=%d", row);
+        StopTouchMediaIfOwned();
+        ESP_LOGI(TAG, "Touch UI menu select group=%d row=%d", touch_menu_group_, row);
+        if (touch_menu_group_ == 1) {
+            if (row == 0) {
+                touch_page_ = TouchPage::kMediaTransfer;
+                RenderMediaTransferPage();
+            } else if (row == 1) {
+                touch_page_ = TouchPage::kMotion;
+                rendered_motion_revision_ = 0;
+                RenderMotionPage(true);
+            } else if (row == 2) {
+                touch_page_ = TouchPage::kAec;
+                RenderAecPage();
+            } else if (row == 3) {
+                touch_page_ = TouchPage::kBattery;
+                RenderBatteryPage();
+            }
+            touch_page_refresh_us_ = esp_timer_get_time();
+            return;
+        }
         if (row == 0) {
             touch_page_ = TouchPage::kVolume;
             touch_value_ = GetAudioCodec()->output_volume();
@@ -899,7 +1108,6 @@ private:
             touch_start_x_ = touch_last_x_ = x;
             touch_start_y_ = touch_last_y_ = y;
             screen_touch_start_us_ = esp_timer_get_time();
-            ESP_LOGI(TAG, "Touch down page=%s x=%d y=%d", TouchPageName(touch_page_), x, y);
             if ((touch_page_ == TouchPage::kVolume || touch_page_ == TouchPage::kBrightness) &&
                 y >= 155 && y <= 235) {
                 slider_dragging_ = true;
@@ -950,13 +1158,8 @@ private:
         const int dy = touch_last_y_ - touch_start_y_;
         const int64_t duration_ms = (esp_timer_get_time() - screen_touch_start_us_) / 1000;
         const bool tap = std::abs(dx) < 12 && std::abs(dy) < 12;
-        ESP_LOGI(TAG, "Touch up page=%s start=(%d,%d) end=(%d,%d) delta=(%d,%d) duration=%lldms tap=%d",
-                 TouchPageName(touch_page_), touch_start_x_, touch_start_y_,
-                 touch_last_x_, touch_last_y_, dx, dy, duration_ms, tap);
-
         if (touch_page_ == TouchPage::kHidden) {
             if (!tap || duration_ms > 800) {
-                ESP_LOGI(TAG, "Touch gesture ignored on hidden page");
                 return;
             }
             if (app.GetDeviceState() == kDeviceStateStarting) {
@@ -982,6 +1185,14 @@ private:
                 CloseTouchSettings();
                 return;
             }
+            if (std::abs(dx) >= 45 && std::abs(dx) > std::abs(dy)) {
+                const int next_group = dx < 0 ? 1 : 0;
+                if (next_group != touch_menu_group_) {
+                    touch_menu_group_ = next_group;
+                    ShowTouchMenu();
+                }
+                return;
+            }
             if (tap && touch_start_y_ >= 82 && touch_start_y_ < 256) {
                 const int column = touch_start_x_ >= 43 && touch_start_x_ < 176 ? 0
                     : touch_start_x_ >= 184 && touch_start_x_ < 317 ? 1 : -1;
@@ -1002,7 +1213,31 @@ private:
             return;
         }
         if (back_tap || back_swipe) {
+            if (touch_page_ == TouchPage::kMediaTransfer) {
+                StopTouchMediaIfOwned();
+            }
             ShowTouchMenu();
+            return;
+        }
+        if (touch_page_ == TouchPage::kMediaTransfer) {
+            if (tap && touch_start_x_ >= 70 && touch_start_x_ <= 290 &&
+                touch_start_y_ >= 260 && touch_start_y_ <= 330) {
+                const auto snapshot = media_transfer_ ? media_transfer_->GetSnapshot()
+                                                       : MediaTransferServer::Snapshot{};
+                QueueMediaOperation(!snapshot.running);
+                RenderMediaTransferPage();
+            }
+            return;
+        }
+        if (touch_page_ == TouchPage::kAec) {
+            if (tap && touch_start_x_ >= 70 && touch_start_x_ <= 290 &&
+                touch_start_y_ >= 260 && touch_start_y_ <= 330) {
+                const bool enable = app.GetAecMode() != kAecOnDeviceSide;
+                Settings settings("aec", true);
+                settings.SetInt("mode", enable ? kAecOnDeviceSide : kAecOff);
+                app.SetAecMode(enable ? kAecOnDeviceSide : kAecOff, false);
+                RenderAecPage();
+            }
             return;
         }
         if (touch_page_ == TouchPage::kVolume || touch_page_ == TouchPage::kBrightness) {
@@ -1122,6 +1357,20 @@ private:
             if (self->touch_page_ == TouchPage::kMusic &&
                 esp_timer_get_time() - self->music_ui_refresh_us_ >= 250 * 1000) {
                 self->RenderMusicPage();
+            }
+            const int64_t now_us = esp_timer_get_time();
+            if (self->touch_page_ == TouchPage::kMediaTransfer &&
+                now_us - self->touch_page_refresh_us_ >= 250 * 1000) {
+                self->RenderMediaTransferPage();
+                self->touch_page_refresh_us_ = now_us;
+            } else if (self->touch_page_ == TouchPage::kMotion && !self->screen_touch_down_ &&
+                       now_us - self->touch_page_refresh_us_ >= 100 * 1000) {
+                self->RenderMotionPage();
+                self->touch_page_refresh_us_ = now_us;
+            } else if (self->touch_page_ == TouchPage::kBattery && !self->screen_touch_down_ &&
+                       now_us - self->touch_page_refresh_us_ >= 1000 * 1000) {
+                self->RenderBatteryPage();
+                self->touch_page_refresh_us_ = now_us;
             }
             if (!self->screen_touch_down_) vTaskDelay(pdMS_TO_TICKS(4));
         }
@@ -1326,7 +1575,7 @@ private:
         auto& server = McpServer::GetInstance();
         server.AddTool(
             "self.media_transfer.start",
-            "Open the Emote device's local Wi-Fi wallpaper management page for 10 minutes. Call when the user asks to upload or manage SD-card wallpapers. The device displays the QR code and IP address for a phone or computer browser.",
+            "Open the Emote device's local Wi-Fi media management page for 30 minutes. Call when the user asks to upload or manage SD-card wallpapers or music. The device displays the QR code and IP address for a phone or computer browser.",
             PropertyList(), [this](const PropertyList&) -> ReturnValue { return media_transfer_->Start(); });
         server.AddTool(
             "self.media_transfer.stop", "Close the local Wi-Fi media transfer page.",
@@ -1628,6 +1877,10 @@ public:
                 [emote_display](const std::string&) { emote_display->HideMediaTransferQr(); });
             RegisterMediaTransferMcpTools();
         }
+        Settings aec_settings("aec", false);
+        auto& app = Application::GetInstance();
+        const int stored_aec_mode = aec_settings.GetInt("mode", app.GetAecMode());
+        app.SetAecMode(stored_aec_mode == kAecOnDeviceSide ? kAecOnDeviceSide : kAecOff, false);
 #ifdef CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
         InitializeCamera();
 #endif // CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE

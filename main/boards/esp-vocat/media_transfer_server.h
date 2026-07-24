@@ -9,6 +9,11 @@
 
 class MediaTransferServer {
 public:
+    struct Snapshot {
+        bool running = false;
+        bool touch_owned = false;
+        std::string url;
+    };
     using RefreshCallback = std::function<void()>;
     using BusyCallback = std::function<bool()>;
     using DisplayCallback = std::function<void(const std::string&)>;
@@ -18,8 +23,11 @@ public:
     ~MediaTransferServer();
 
     std::string Start();
+    std::string StartForTouch();
     std::string Stop();
+    std::string StopForTouch();
     std::string Status() const;
+    Snapshot GetSnapshot() const;
 
 private:
     static void TimeoutCallback(void* arg);
@@ -39,7 +47,8 @@ private:
     void SendJson(httpd_req_t* req, int status, const std::string& body) const;
     void SendError(httpd_req_t* req, int status, const char* message) const;
     std::string ListFiles(FileType type) const;
-    void StopLocked();
+    std::string StartLocked(bool touch_owned, bool show_qr);
+    void StopLocked(bool hide_qr = true);
 
     RefreshCallback refresh_wallpapers_;
     RefreshCallback refresh_music_;
@@ -50,4 +59,5 @@ private:
     httpd_handle_t server_ = nullptr;
     esp_timer_handle_t timeout_timer_ = nullptr;
     std::string url_;
+    bool touch_owned_ = false;
 };

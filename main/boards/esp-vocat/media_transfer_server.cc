@@ -69,8 +69,7 @@ MediaTransferServer::MediaTransferServer(RefreshCallback refresh_wallpapers, Ref
 
 MediaTransferServer::~MediaTransferServer() { std::lock_guard<std::mutex> lock(mutex_); StopLocked(); if (timeout_timer_) esp_timer_delete(timeout_timer_); }
 
-std::string MediaTransferServer::Start() {
-    std::lock_guard<std::mutex> lock(mutex_);
+std::string MediaTransferServer::StartLocked(bool touch_owned, bool show_qr) {
     if (server_) return "Wallpaper server is already open: " + url_;
     if (!WifiManager::GetInstance().IsConnected()) return "Wi-Fi is not connected.";
     const std::string mount_error = SdCardManager::GetInstance().EnsureMounted();
@@ -81,14 +80,40 @@ std::string MediaTransferServer::Start() {
     if (httpd_start(&server_, &config) != ESP_OK) { server_ = nullptr; url_.clear(); return "Unable to start the local wallpaper server."; }
     const httpd_uri_t routes[] = {{.uri = "/*", .method = HTTP_GET, .handler = GetHandler, .user_ctx = this}, {.uri = "/api/upload", .method = HTTP_PUT, .handler = UploadHandler, .user_ctx = this}, {.uri = "/api/file", .method = HTTP_DELETE, .handler = DeleteHandler, .user_ctx = this}, {.uri = "/api/rename", .method = HTTP_POST, .handler = RenameHandler, .user_ctx = this}};
     for (const auto& route : routes) httpd_register_uri_handler(server_, &route);
-    esp_timer_start_once(timeout_timer_, kSessionUs); show_qr_(url_); ESP_LOGI(kTag, "Wallpaper server started: %s", url_.c_str());
+    touch_owned_ = touch_owned;
+    esp_timer_start_once(timeout_timer_, kSessionUs);
+    if (show_qr) show_qr_(url_);
+    ESP_LOGI(kTag, "Wallpaper server started: %s", url_.c_str());
     return "Media manager is open for 30 minutes. Open " + url_ + " on a phone or computer.";
 }
 
+std::string MediaTransferServer::Start() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return StartLocked(false, true);
+}
+
+std::string MediaTransferServer::StartForTouch() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return StartLocked(true, false);
+}
+
 std::string MediaTransferServer::Stop() { std::lock_guard<std::mutex> lock(mutex_); if (!server_) return "Wallpaper server is already closed."; StopLocked(); return "Wallpaper server closed."; }
+std::string MediaTransferServer::StopForTouch() { std::lock_guard<std::mutex> lock(mutex_); if (!server_) return "Wallpaper server is already closed."; StopLocked(false); return "Wallpaper server closed."; }
 std::string MediaTransferServer::Status() const { std::lock_guard<std::mutex> lock(mutex_); return server_ ? "Wallpaper server is open: " + url_ : "Wallpaper server is closed."; }
-void MediaTransferServer::TimeoutCallback(void* arg) { static_cast<MediaTransferServer*>(arg)->Stop(); }
-void MediaTransferServer::StopLocked() { if (timeout_timer_) esp_timer_stop(timeout_timer_); if (server_) { httpd_stop(server_); server_ = nullptr; } url_.clear(); hide_qr_(""); }
+MediaTransferServer::Snapshot MediaTransferServer::GetSnapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Snapshot snapshot;
+    snapshot.running = server_ != nullptr;
+    snapshot.touch_owned = touch_owned_;
+    snapshot.url = url_;
+    return snapshot;
+}
+void MediaTransferServer::TimeoutCallback(void* arg) {
+    auto* self = static_cast<MediaTransferServer*>(arg);
+    std::lock_guard<std::mutex> lock(self->mutex_);
+    if (self->server_) self->StopLocked(!self->touch_owned_);
+}
+void MediaTransferServer::StopLocked(bool hide_qr) { if (timeout_timer_) esp_timer_stop(timeout_timer_); if (server_) { httpd_stop(server_); server_ = nullptr; } url_.clear(); touch_owned_ = false; if (hide_qr) hide_qr_(""); }
 
 std::string MediaTransferServer::ReadQuery(httpd_req_t* req, const char* key) const { const size_t length = httpd_req_get_url_query_len(req); if (!length || length > 512) return {}; std::string query(length + 1, '\0'), value(512, '\0'); if (httpd_req_get_url_query_str(req, query.data(), query.size()) != ESP_OK || httpd_query_key_value(query.c_str(), key, value.data(), value.size()) != ESP_OK) return {}; value.resize(strlen(value.c_str())); return UrlDecode(value); }
 bool MediaTransferServer::ParseFileType(httpd_req_t* req, FileType& type) const { const std::string value = Lower(ReadQuery(req, "type")); if (value.empty() || value == "wallpaper") { type = FileType::kWallpaper; return true; } if (value == "music") { type = FileType::kMusic; return true; } return false; }

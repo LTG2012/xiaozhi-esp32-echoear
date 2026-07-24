@@ -45,7 +45,7 @@ public:
     bool ShowMediaTransferQr(const char* url);
     void HideMediaTransferQr();
 
-    void ShowTouchMenu(int reveal_height = 360, const char* volume = nullptr,
+    void ShowTouchMenu(int reveal_height = 360, int group = 0, const char* volume = nullptr,
                        const char* brightness = nullptr, const char* wallpaper = nullptr,
                        const char* music = nullptr);
     void ShowTouchSlider(const char* title, int value);
@@ -54,6 +54,11 @@ public:
     void ShowTouchMusic(const std::vector<std::string>& titles, int first_index,
                         int selected_index, const char* status, const char* primary_control);
     void ShowTouchMusicPlayback();
+    void ShowTouchMediaTransfer(bool running, bool pending, const char* url, const char* message);
+    void ShowTouchMotion(int x_mg, int y_mg, int z_mg, bool valid, const char* status);
+    void ShowTouchAec(bool enabled);
+    void ShowTouchBattery(int level, int voltage_mv, int current_ma,
+                          bool charging, bool discharging, bool valid);
     void HideTouchSettings();
     int GetTouchWallpaperCount();
     int GetTouchWallpaperIndex() const { return wallpaper_index_; }
@@ -117,6 +122,10 @@ private:
     bool wallpaper_idle_ = false;
     bool wallpaper_music_active_ = false;
     bool wallpaper_visible_ = false;
+    // The control center is drawn above the wallpaper image, but wallpaper
+    // metadata uses independent labels. Keep those labels hidden while the
+    // control center owns the foreground.
+    bool touch_wallpaper_overlay_hidden_ = false;
     std::atomic<bool> wallpaper_refresh_requested_ = false;
     int wallpaper_index_ = 0;
     int wallpaper_last_minute_ = -1;
@@ -152,13 +161,23 @@ private:
     bool touch_music_overlay_suppressed_ = false;
     bool touch_wallpaper_preview_ = false;
     bool touch_wallpaper_restore_visible_ = false;
-    enum class TouchView { kNone, kMenu, kSlider, kWallpaper, kMusic, kPlayback };
+    enum class TouchView { kNone, kMenu, kSlider, kWallpaper, kMusic, kPlayback,
+                           kMediaTransfer, kMotion, kAec, kBattery };
     TouchView touch_view_ = TouchView::kNone;
     int touch_menu_offset_ = 1;
     int touch_slider_value_ = -1;
     std::string touch_slider_title_;
     std::array<bool, kTouchRowCount> touch_row_visible_ = {};
     std::string touch_primary_control_;
+    int touch_menu_group_ = 0;
+    int touch_motion_x_mg_ = 0;
+    int touch_motion_y_mg_ = 0;
+    int touch_motion_z_mg_ = 0;
+    bool touch_media_state_valid_ = false;
+    bool touch_media_running_ = false;
+    bool touch_media_pending_ = false;
+    std::string touch_media_url_;
+    std::string touch_media_message_;
 
     bool EnsureMusicUi();
     gfx_font_t EnsureCommonTextFont();
@@ -181,6 +200,8 @@ private:
     void HideWallpaper();
     void TickWallpaper();
     void UpdateWallpaperText(bool force = false);
+    void HideWallpaperOverlayForTouch();
+    void RestoreWallpaperOverlayAfterTouch();
     void CacheWeatherFromAssistantMessage(const char* content);
     void LoadWallpaperSettings();
     void SaveWallpaperSettings();
@@ -189,6 +210,9 @@ private:
     void RenderTouchSurface(TouchView view, int selected_row = -1);
     bool InitializeTouchSliderVisual();
     void RenderTouchSliderVisual(int value);
+    void ShowTouchInfoPage(TouchView view, const char* title,
+                           const std::array<std::string, 4>& rows,
+                           const char* action = nullptr, bool action_active = false);
     void HideTouchObjects();
     void UpdateTouchMenuOffset(int reveal_height);
     void RestoreTouchWallpaperPreview();

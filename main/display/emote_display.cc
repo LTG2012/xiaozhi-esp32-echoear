@@ -1688,9 +1688,10 @@ void EmoteDisplay::ShowWallpaper()
     gfx_obj_set_visible(wallpaper_image_, true);
     gfx_label_set_opa(wallpaper_fade_, 115);
     gfx_obj_set_visible(wallpaper_fade_, true);
-    gfx_obj_set_visible(wallpaper_date_, true);
-    gfx_obj_set_visible(wallpaper_time_, true);
-    gfx_obj_set_visible(wallpaper_weather_, !wallpaper_condition_.empty());
+    gfx_obj_set_visible(wallpaper_date_, !touch_wallpaper_overlay_hidden_);
+    gfx_obj_set_visible(wallpaper_time_, !touch_wallpaper_overlay_hidden_);
+    gfx_obj_set_visible(wallpaper_weather_, !touch_wallpaper_overlay_hidden_ &&
+                        !wallpaper_condition_.empty());
     emote_unlock(emote_handle_);
     UpdateWallpaperText(true);
     UpdateStatusBar();
@@ -1865,9 +1866,39 @@ void EmoteDisplay::UpdateWallpaperText(bool force)
     gfx_label_set_text(wallpaper_date_, date);
     gfx_label_set_text(wallpaper_time_, clock);
     gfx_label_set_text(wallpaper_weather_, weather.c_str());
-    gfx_obj_set_visible(wallpaper_weather_, !weather.empty());
+    gfx_obj_set_visible(wallpaper_weather_, !touch_wallpaper_overlay_hidden_ && !weather.empty());
     emote_unlock(emote_handle_);
     wallpaper_last_minute_ = minute_key;
+}
+
+void EmoteDisplay::HideWallpaperOverlayForTouch()
+{
+    if (!wallpaper_visible_ || touch_wallpaper_overlay_hidden_ || !emote_handle_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    gfx_obj_set_visible(wallpaper_date_, false);
+    gfx_obj_set_visible(wallpaper_time_, false);
+    gfx_obj_set_visible(wallpaper_weather_, false);
+    emote_unlock(emote_handle_);
+    touch_wallpaper_overlay_hidden_ = true;
+}
+
+void EmoteDisplay::RestoreWallpaperOverlayAfterTouch()
+{
+    if (!touch_wallpaper_overlay_hidden_) {
+        return;
+    }
+    touch_wallpaper_overlay_hidden_ = false;
+    if (!wallpaper_visible_ || !emote_handle_) {
+        return;
+    }
+    emote_lock(emote_handle_);
+    gfx_obj_set_visible(wallpaper_date_, true);
+    gfx_obj_set_visible(wallpaper_time_, true);
+    gfx_obj_set_visible(wallpaper_weather_, !wallpaper_condition_.empty());
+    emote_unlock(emote_handle_);
+    UpdateWallpaperText(true);
 }
 
 void EmoteDisplay::LoadWallpaperSettings()
@@ -1946,8 +1977,10 @@ void EmoteDisplay::RenderTouchSurface(TouchView view, int selected_row)
             std::memset(alphas + static_cast<size_t>(y) * kTouchSurfaceWidth,
                         255, kTouchSurfaceWidth);
         }
-        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
-                               154, 19, 52, 4, 2, 0x6CE7F2, 210);
+        if (view != TouchView::kMotion) {
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   154, 19, 52, 4, 2, 0x6CE7F2, 210);
+        }
     }
 
     if (view == TouchView::kMenu) {
@@ -1961,11 +1994,17 @@ void EmoteDisplay::RenderTouchSurface(TouchView view, int selected_row)
                                    x, y, 133, 82, 18, 0x263443);
             FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
                                    x + 1, y + 1, 131, 80, 17, 0x111B27);
+            const uint32_t accent = touch_menu_group_ == 0 ? 0x58DCE8 : 0xA983FF;
             FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
-                                   x + 16, y + 13, 24, 4, 2, 0x58DCE8, i == 0 ? 255 : 145);
+                                   x + 16, y + 13, 24, 4, 2, accent, i == 0 ? 255 : 145);
         }
         FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
                                114, 278, 132, 34, 17, 0x111A24);
+        FillTouchUiCircle(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                          174, 326, touch_menu_group_ == 0 ? 5 : 3, 0x64EAF4);
+        FillTouchUiCircle(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                          186, 326, touch_menu_group_ == 1 ? 5 : 3, 0x64EAF4,
+                          touch_menu_group_ == 1 ? 255 : 120);
     } else if (view == TouchView::kSlider) {
         FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
                                68, 101, 224, 70, 24, 0x273443);
@@ -2004,6 +2043,38 @@ void EmoteDisplay::RenderTouchSurface(TouchView view, int selected_row)
     } else if (view == TouchView::kPlayback) {
         FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
                                58, 28, 150, 48, 22, 0x071019, 205);
+    } else if (view == TouchView::kMediaTransfer || view == TouchView::kMotion ||
+               view == TouchView::kAec || view == TouchView::kBattery) {
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               48, 94, 264, 154, 24, 0x263443);
+        FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                               49, 95, 262, 152, 23, 0x111B27);
+        if (view == TouchView::kMediaTransfer || view == TouchView::kAec) {
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   96, 274, 168, 40, 20, 0x56E0EA);
+            FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                   97, 275, 166, 38, 19, 0x116678);
+        }
+        if (view == TouchView::kMotion) {
+            static constexpr std::array<int, 3> ys = {126, 160, 194};
+            static constexpr std::array<uint32_t, 3> colors = {0x65E8F5, 0x87D8FF, 0xB899FF};
+            const std::array<int, 3> values = {touch_motion_x_mg_, touch_motion_y_mg_, touch_motion_z_mg_};
+            for (size_t i = 0; i < values.size(); ++i) {
+                const int center = 184;
+                const int extent = std::clamp(values[i] * 72 / 1000, -72, 72);
+                FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                       108, ys[i], 152, 5, 2, 0x263443);
+                FillTouchUiRoundedRect(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                                       center + std::min(0, extent), ys[i], std::max(3, std::abs(extent)), 5,
+                                       2, colors[i]);
+            }
+            FillTouchUiCircle(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                              184, 229, 20, 0x182938);
+            FillTouchUiCircle(touch_surface_image_data_, kTouchSurfaceWidth, kTouchSurfaceHeight,
+                              184 + std::clamp(touch_motion_x_mg_ * 15 / 1000, -14, 14),
+                              229 - std::clamp(touch_motion_y_mg_ * 15 / 1000, -14, 14),
+                              6, 0x64EAF4);
+        }
     }
 }
 
@@ -2164,6 +2235,7 @@ void EmoteDisplay::HideTouchObjects()
     touch_menu_offset_ = 1;
     touch_slider_value_ = -1;
     touch_row_visible_.fill(false);
+    touch_media_state_valid_ = false;
 }
 
 void EmoteDisplay::RestoreTouchWallpaperPreview()
@@ -2206,7 +2278,7 @@ void EmoteDisplay::UpdateTouchMenuOffset(int reveal_height)
     touch_menu_offset_ = offset;
 }
 
-void EmoteDisplay::ShowTouchMenu(int reveal_height, const char* volume,
+void EmoteDisplay::ShowTouchMenu(int reveal_height, int group, const char* volume,
                                  const char* brightness, const char* wallpaper,
                                  const char* music)
 {
@@ -2214,16 +2286,15 @@ void EmoteDisplay::ShowTouchMenu(int reveal_height, const char* volume,
     touch_music_overlay_suppressed_ = true;
     SetMusicOverlayVisible(false);
     RestoreTouchWallpaperPreview();
+    if (media_transfer_qr_visible_) HideMediaTransferQr();
+    HideWallpaperOverlayForTouch();
+    group = std::clamp(group, 0, 1);
     const bool initialize = touch_view_ != TouchView::kMenu;
+    const bool group_changed = initialize || group != touch_menu_group_;
     if (initialize) {
         HideTouchObjects();
         touch_view_ = TouchView::kMenu;
         touch_settings_visible_ = true;
-        static constexpr std::array<const char*, 4> defaults = {
-            "音量", "亮度", "壁纸", "音乐",
-        };
-        const std::array<const char*, 4> states = {volume, brightness, wallpaper, music};
-        RenderTouchSurface(TouchView::kMenu);
         emote_lock(emote_handle_);
         gfx_label_set_opa(touch_background_, 255);
         gfx_obj_set_visible(touch_background_, true);
@@ -2241,20 +2312,33 @@ void EmoteDisplay::ShowTouchMenu(int reveal_height, const char* volume,
             gfx_label_set_color(touch_rows_[i], GFX_COLOR_HEX(0xF5F8FA));
             gfx_label_set_bg_enable(touch_rows_[i], false);
             gfx_obj_set_size(touch_rows_[i], 115, 27);
-            gfx_label_set_text(touch_rows_[i], defaults[i]);
             gfx_obj_set_visible(touch_rows_[i], true);
             gfx_obj_set_size(touch_statuses_[i], 115, 27);
+            gfx_obj_set_visible(touch_statuses_[i], true);
+        }
+        gfx_obj_set_size(touch_footer_, 150, 27);
+        gfx_obj_set_visible(touch_footer_, true);
+        emote_unlock(emote_handle_);
+        touch_menu_offset_ = 1;
+    }
+    if (group_changed) {
+        touch_menu_group_ = group;
+        static constexpr std::array<const char*, 4> first_group = {"音量", "亮度", "壁纸", "音乐"};
+        static constexpr std::array<const char*, 4> second_group = {"媒体传输", "BMI270", "回声消除", "电池"};
+        const auto& titles = group == 0 ? first_group : second_group;
+        const std::array<const char*, 4> states = {volume, brightness, wallpaper, music};
+        RenderTouchSurface(TouchView::kMenu);
+        emote_lock(emote_handle_);
+        gfx_img_set_src(touch_surface_, &touch_surface_image_);
+        for (size_t i = 0; i < 4; ++i) {
+            gfx_label_set_text(touch_rows_[i], titles[i]);
             const std::string state = states[i] && states[i][0]
                                           ? TruncateTouchText(states[i], 105)
                                           : "--";
             gfx_label_set_text(touch_statuses_[i], state.c_str());
-            gfx_obj_set_visible(touch_statuses_[i], true);
         }
-        gfx_obj_set_size(touch_footer_, 150, 27);
-        gfx_label_set_text(touch_footer_, "上滑收起");
-        gfx_obj_set_visible(touch_footer_, true);
+        gfx_label_set_text(touch_footer_, group == 0 ? "左滑查看设备状态" : "右滑返回 · 上滑收起");
         emote_unlock(emote_handle_);
-        touch_menu_offset_ = 1;
     }
     UpdateTouchMenuOffset(reveal_height);
 }
@@ -2527,12 +2611,179 @@ void EmoteDisplay::ShowTouchMusicPlayback()
     emote_unlock(emote_handle_);
 }
 
+void EmoteDisplay::ShowTouchInfoPage(TouchView view, const char* title,
+                                     const std::array<std::string, 4>& rows,
+                                     const char* action, bool action_active)
+{
+    if (!EnsureTouchSettingsUi()) return;
+    touch_music_overlay_suppressed_ = true;
+    SetMusicOverlayVisible(false);
+    RestoreTouchWallpaperPreview();
+    if (media_transfer_qr_visible_) HideMediaTransferQr();
+    const bool initialize = touch_view_ != view;
+    if (initialize) {
+        HideTouchObjects();
+        touch_view_ = view;
+    }
+    touch_settings_visible_ = true;
+    RenderTouchSurface(view);
+    emote_lock(emote_handle_);
+    gfx_label_set_opa(touch_background_, 255);
+    gfx_obj_set_pos(touch_background_, 0, 0);
+    gfx_obj_set_visible(touch_background_, true);
+    gfx_img_set_src(touch_surface_, &touch_surface_image_);
+    gfx_obj_set_pos(touch_surface_, 0, 0);
+    gfx_obj_set_visible(touch_surface_, true);
+    gfx_obj_set_size(touch_back_, 82, 36);
+    gfx_obj_set_pos(touch_back_, 64, 37);
+    gfx_label_set_text(touch_back_, "< 返回");
+    gfx_obj_set_visible(touch_back_, true);
+    gfx_obj_set_size(touch_title_, 148, 36);
+    gfx_obj_set_pos(touch_title_, 106, 37);
+    gfx_label_set_font(touch_title_, EnsureCommonTextFont());
+    gfx_label_set_text(touch_title_, title ? title : "设备状态");
+    gfx_obj_set_visible(touch_title_, true);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        gfx_obj_set_size(touch_rows_[i], 222, 28);
+        gfx_obj_set_pos(touch_rows_[i], 69, 103 + static_cast<int>(i) * 34);
+        gfx_label_set_font(touch_rows_[i], EnsureCommonTextFont());
+        gfx_label_set_color(touch_rows_[i], i == 0 ? GFX_COLOR_HEX(0xF4FCFD)
+                                                    : GFX_COLOR_HEX(0xB7C6D4));
+        gfx_label_set_text(touch_rows_[i], rows[i].c_str());
+        gfx_obj_set_visible(touch_rows_[i], !rows[i].empty());
+    }
+    if (view == TouchView::kBattery) {
+        gfx_label_set_font(touch_rows_[0], static_cast<gfx_font_t>(
+            const_cast<lv_font_t*>(&font_puhui_basic_30_4)));
+        gfx_obj_set_size(touch_rows_[0], 222, 42);
+        gfx_obj_set_pos(touch_rows_[0], 69, 98);
+    }
+    for (auto* status : touch_statuses_) gfx_obj_set_visible(status, false);
+    for (size_t i = 0; i < touch_controls_.size(); ++i) {
+        if (i == 0 && action && action[0]) {
+            gfx_obj_set_size(touch_controls_[i], 166, 40);
+            gfx_obj_set_pos(touch_controls_[i], 97, 274);
+            gfx_label_set_color(touch_controls_[i], action_active ? GFX_COLOR_HEX(0xF4FEFF)
+                                                                    : GFX_COLOR_HEX(0x9EAFBD));
+            gfx_label_set_text(touch_controls_[i], action);
+            gfx_obj_set_visible(touch_controls_[i], true);
+        } else {
+            gfx_obj_set_visible(touch_controls_[i], false);
+        }
+    }
+    gfx_obj_set_size(touch_footer_, 230, 22);
+    gfx_obj_set_pos(touch_footer_, 65, 322);
+    gfx_label_set_text(touch_footer_, "");
+    gfx_obj_set_visible(touch_footer_, false);
+    emote_unlock(emote_handle_);
+}
+
+void EmoteDisplay::ShowTouchMediaTransfer(bool running, bool pending, const char* url,
+                                          const char* message)
+{
+    const std::string current_url = url ? url : "";
+    const std::string current_message = message ? message : "";
+    if (touch_media_state_valid_ && touch_media_running_ == running &&
+        touch_media_pending_ == pending && touch_media_url_ == current_url &&
+        touch_media_message_ == current_message) {
+        return;
+    }
+    if (running && url && url[0]) {
+        if (!EnsureTouchSettingsUi()) return;
+        if (touch_view_ != TouchView::kMediaTransfer || !media_transfer_qr_visible_) {
+            HideTouchObjects();
+            touch_view_ = TouchView::kMediaTransfer;
+            touch_settings_visible_ = true;
+            ShowMediaTransferQr(url);
+            emote_lock(emote_handle_);
+            gfx_obj_set_size(touch_back_, 82, 36);
+            gfx_obj_set_pos(touch_back_, 64, 22);
+            gfx_label_set_text(touch_back_, "< 返回");
+            gfx_obj_set_visible(touch_back_, true);
+            gfx_obj_set_size(touch_title_, 150, 36);
+            gfx_obj_set_pos(touch_title_, 106, 22);
+            gfx_label_set_font(touch_title_, EnsureCommonTextFont());
+            gfx_label_set_text(touch_title_, "媒体传输");
+            gfx_obj_set_visible(touch_title_, true);
+            gfx_obj_set_size(touch_footer_, 160, 22);
+            gfx_obj_set_pos(touch_footer_, 100, 258);
+            gfx_label_set_text(touch_footer_, "返回将关闭媒体传输");
+            gfx_obj_set_visible(touch_footer_, true);
+            emote_unlock(emote_handle_);
+        }
+        touch_media_state_valid_ = true;
+        touch_media_running_ = running;
+        touch_media_pending_ = pending;
+        touch_media_url_ = current_url;
+        touch_media_message_ = current_message;
+        return;
+    }
+    const std::string state = pending ? "正在处理，请稍候" : "本机媒体传输已关闭";
+    ShowTouchInfoPage(TouchView::kMediaTransfer, "媒体传输",
+                      {state, message && message[0] ? message : "连接同一 Wi-Fi 后可开启", "支持壁纸和音乐文件", "返回本页将自动关闭"},
+                      pending ? "处理中" : "开启媒体传输", !pending);
+    touch_media_state_valid_ = true;
+    touch_media_running_ = running;
+    touch_media_pending_ = pending;
+    touch_media_url_ = current_url;
+    touch_media_message_ = current_message;
+}
+
+void EmoteDisplay::ShowTouchMotion(int x_mg, int y_mg, int z_mg, bool valid, const char* status)
+{
+    touch_motion_x_mg_ = x_mg;
+    touch_motion_y_mg_ = y_mg;
+    touch_motion_z_mg_ = z_mg;
+    auto format_axis = [](const char* axis, int value) {
+        char text[32];
+        const int magnitude = std::abs(value);
+        std::snprintf(text, sizeof(text), "%s  %c%d.%03d g", axis, value < 0 ? '-' : '+',
+                      magnitude / 1000, magnitude % 1000);
+        return std::string(text);
+    };
+    ShowTouchInfoPage(TouchView::kMotion, "BMI270",
+                      {valid ? format_axis("X", x_mg) : "传感器不可用",
+                       valid ? format_axis("Y", y_mg) : "",
+                       valid ? format_axis("Z", z_mg) : "",
+                       status ? status : ""});
+}
+
+void EmoteDisplay::ShowTouchAec(bool enabled)
+{
+    ShowTouchInfoPage(TouchView::kAec, "回声消除",
+                      {enabled ? "设备端 AEC 已开启" : "设备端 AEC 已关闭",
+                       "使用麦克风与播放参考通道", "切换后下次语音会话生效", "设置会在重启后保留"},
+                      enabled ? "关闭 AEC" : "开启 AEC", true);
+}
+
+void EmoteDisplay::ShowTouchBattery(int level, int voltage_mv, int current_ma,
+                                    bool charging, bool discharging, bool valid)
+{
+    if (!valid) {
+        ShowTouchInfoPage(TouchView::kBattery, "电池状态",
+                          {"电池数据不可用", "请检查充电计连接", "", ""});
+        return;
+    }
+    char percent[24];
+    char voltage[32];
+    char current[32];
+    std::snprintf(percent, sizeof(percent), "%d%%", std::clamp(level, 0, 100));
+    std::snprintf(voltage, sizeof(voltage), "电压  %d.%03d V", voltage_mv / 1000,
+                  std::abs(voltage_mv % 1000));
+    std::snprintf(current, sizeof(current), "电流  %+d mA", current_ma);
+    ShowTouchInfoPage(TouchView::kBattery, "电池状态",
+                      {percent, charging ? "正在充电" : discharging ? "正在放电" : "空闲",
+                       voltage, current});
+}
+
 void EmoteDisplay::HideTouchSettings()
 {
     if (!touch_settings_visible_) return;
+    if (media_transfer_qr_visible_) HideMediaTransferQr();
     RestoreTouchWallpaperPreview();
     HideTouchObjects();
     touch_settings_visible_ = false;
+    RestoreWallpaperOverlayAfterTouch();
     touch_music_overlay_suppressed_ = false;
     SetMusicOverlayVisible(true);
 }

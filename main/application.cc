@@ -1125,23 +1125,23 @@ void Application::SendMcpMessage(const std::string& payload) {
     });
 }
 
-void Application::SetAecMode(AecMode mode) {
+void Application::SetAecMode(AecMode mode, bool show_notification) {
     aec_mode_ = mode;
-    Schedule([this]() {
+    Schedule([this, mode, show_notification]() {
         auto& board = Board::GetInstance();
         auto display = board.GetDisplay();
-        switch (aec_mode_) {
+        switch (mode) {
         case kAecOff:
             audio_service_.EnableDeviceAec(false);
-            display->ShowNotification(Lang::Strings::RTC_MODE_OFF);
+            if (show_notification) display->ShowNotification(Lang::Strings::RTC_MODE_OFF);
             break;
         case kAecOnServerSide:
             audio_service_.EnableDeviceAec(false);
-            display->ShowNotification(Lang::Strings::RTC_MODE_ON);
+            if (show_notification) display->ShowNotification(Lang::Strings::RTC_MODE_ON);
             break;
         case kAecOnDeviceSide:
             audio_service_.EnableDeviceAec(true);
-            display->ShowNotification(Lang::Strings::RTC_MODE_ON);
+            if (show_notification) display->ShowNotification(Lang::Strings::RTC_MODE_ON);
             break;
         }
 
